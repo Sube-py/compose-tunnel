@@ -1,0 +1,27 @@
+[workspace]
+members = [
+  "crates/compose-tunnel-core",
+  "crates/compose-tunnel-cli",
+  "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["sube"]
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+portpicker = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shell-words = "1"
+tauri = "2"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"

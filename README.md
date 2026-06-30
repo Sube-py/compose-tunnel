@@ -1,7 +1,51 @@
-# Tauri + Vue + TypeScript
+# compose-tunnel
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+`compose-tunnel` forwards internal Docker Compose services on a remote server to a local port through SSH. It starts a temporary `socat` container inside the target Compose network and forwards local traffic directly to that container IP, without publishing a remote host port.
 
-## Recommended IDE Setup
+```text
+127.0.0.1:localPort
+  -> SSH LocalForward
+  -> remote socat container IP:socatPort
+  -> compose service name:targetPort
+```
 
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## What Is Implemented
+
+- Shared Rust core crate for config, state, SSH, Docker, tunnel lifecycle, cleanup, and env file blocks.
+- CLI binary named `compose-tunnel`.
+- Tauri 2 desktop app using the same Rust core.
+- Vue 3 UI for servers, Compose discovery, tunnel start/stop, env preview/write, logs, and settings.
+- User config and state under the platform config directory via the `directories` crate.
+
+## Run The CLI
+
+```bash
+cargo run -p compose-tunnel-cli -- init
+cargo run -p compose-tunnel-cli -- server add staging --host staging.example.com --user deploy
+cargo run -p compose-tunnel-cli -- server test staging
+cargo run -p compose-tunnel-cli -- compose list --server staging
+cargo run -p compose-tunnel-cli -- compose services --server staging --project myapp
+cargo run -p compose-tunnel-cli -- open --server staging --project myapp --service db --target-port 5432
+cargo run -p compose-tunnel-cli -- status
+cargo run -p compose-tunnel-cli -- env db
+cargo run -p compose-tunnel-cli -- close db
+```
+
+## Run The Desktop App
+
+```bash
+npm install
+npm run tauri dev
+```
+
+## Verify
+
+```bash
+cargo check --workspace
+cargo test -p compose-tunnel-core
+npm run build
+```
+
+## Notes
+
+The MVP uses the system `ssh` binary so existing SSH config, keys, agents, and ProxyJump rules continue to work. Remote Docker access is performed by running `docker` over SSH.

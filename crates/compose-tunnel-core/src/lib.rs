@@ -1,0 +1,1074 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
+
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    fs,
+    process::{Child, Command},
+};
+
+pub type Result<T> = std::result::Result<T, AppError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    TomlDe(#[from] toml::de::Error),
+    #[error(transparent)]
+    TomlSer(#[from] toml::ser::Error),
+}
+
+impl AppError {
+    pub fn msg(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub defaults: Defaults,
+    #[serde(default)]
+    pub servers: Vec<ServerConfig>,
+    #[serde(default)]
+    pub profiles: Vec<ProfileConfig>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            defaults: Defaults::default(),
+            servers: Vec::new(),
+            profiles: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Defaults {
+    #[serde(default = "default_local_host")]
+    pub local_host: String,
+    #[serde(default = "default_socat_image")]
+    pub socat_image: String,
+    #[serde(default = "default_socat_command")]
+    pub socat_command: String,
+    #[serde(default = "default_ssh_binary")]
+    pub ssh_binary: String,
+    #[serde(default = "default_docker_timeout_secs")]
+    pub docker_timeout_secs: u64,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self {
+            local_host: default_local_host(),
+            socat_image: default_socat_image(),
+            socat_command: default_socat_command(),
+            ssh_binary: default_ssh_binary(),
+            docker_timeout_secs: default_docker_timeout_secs(),
+        }
+    }
+}
+
+fn default_local_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_socat_image() -> String {
+    "alpine/socat:latest".to_string()
+}
+
+fn default_socat_command() -> String {
+    "socat".to_string()
+}
+
+fn default_ssh_binary() -> String {
+    "ssh".to_string()
+}
+
+fn default_docker_timeout_secs() -> u64 {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub user: String,
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    #[serde(default)]
+    pub ssh_alias: Option<String>,
+    #[serde(default)]
+    pub default_socat_image: Option<String>,
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProfileConfig {
+    pub name: String,
+    pub server: String,
+    pub project: String,
+    pub service: String,
+    #[serde(default)]
+    pub network: Option<String>,
+    pub target_port: u16,
+    #[serde(default)]
+    pub env_prefix: Option<String>,
+    #[serde(default)]
+    pub env: Vec<EnvEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvEntry {
+    pub key: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppState {
+    #[serde(default)]
+    pub tunnels: Vec<TunnelState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelStatus {
+    Running,
+    Stopped,
+    Error,
+}
+
+impl Default for TunnelStatus {
+    fn default() -> Self {
+        Self::Stopped
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelState {
+    pub id: String,
+    pub server: String,
+    pub project: String,
+    pub service: String,
+    pub network: String,
+    pub target_port: u16,
+    pub socat_port: u16,
+    pub local_host: String,
+    pub local_port: u16,
+    pub socat_container: String,
+    pub socat_container_ip: String,
+    #[serde(default)]
+    pub ssh_pid: Option<u32>,
+    #[serde(default)]
+    pub status: TunnelStatus,
+    #[serde(default)]
+    pub mode: TunnelMode,
+    #[serde(default)]
+    pub env_prefix: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelMode {
+    SocatDirect,
+}
+
+impl Default for TunnelMode {
+    fn default() -> Self {
+        Self::SocatDirect
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenTunnelRequest {
+    pub server: String,
+    pub project: String,
+    pub service: String,
+    pub target_port: u16,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub local_port: Option<u16>,
+    #[serde(default)]
+    pub local_host: Option<String>,
+    #[serde(default)]
+    pub socat_port: Option<u16>,
+    #[serde(default)]
+    pub socat_image: Option<String>,
+    #[serde(default)]
+    pub env_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteEnvFileRequest {
+    pub tunnel_id: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeProject {
+    pub server: String,
+    pub project: String,
+    pub services: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeService {
+    pub service: String,
+    pub container: String,
+    pub status: String,
+    pub ports: Vec<String>,
+    pub networks: Vec<String>,
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerTestResult {
+    pub ssh_ok: bool,
+    pub docker_ok: bool,
+    pub socat_image_ok: bool,
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupResult {
+    pub server: String,
+    pub containers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPaths {
+    pub config_dir: PathBuf,
+    pub config_file: PathBuf,
+    pub state_file: PathBuf,
+    pub logs_dir: PathBuf,
+}
+
+pub fn app_paths() -> Result<AppPaths> {
+    let dirs = ProjectDirs::from("", "", "compose-tunnel")
+        .ok_or_else(|| AppError::msg("could not resolve user config directory"))?;
+    let config_dir = dirs.config_dir().to_path_buf();
+    Ok(AppPaths {
+        config_file: config_dir.join("config.toml"),
+        state_file: config_dir.join("state.json"),
+        logs_dir: config_dir.join("logs"),
+        config_dir,
+    })
+}
+
+pub async fn init_config() -> Result<AppPaths> {
+    let paths = app_paths()?;
+    fs::create_dir_all(&paths.config_dir).await?;
+    fs::create_dir_all(&paths.logs_dir).await?;
+    if !paths.config_file.exists() {
+        save_config(&AppConfig::default()).await?;
+    }
+    if !paths.state_file.exists() {
+        save_state(&AppState::default()).await?;
+    }
+    Ok(paths)
+}
+
+pub async fn load_config() -> Result<AppConfig> {
+    let paths = init_config().await?;
+    let raw = fs::read_to_string(paths.config_file).await?;
+    Ok(toml::from_str(&raw)?)
+}
+
+pub async fn save_config(config: &AppConfig) -> Result<()> {
+    let paths = app_paths()?;
+    fs::create_dir_all(&paths.config_dir).await?;
+    fs::write(&paths.config_file, toml::to_string_pretty(config)?).await?;
+    Ok(())
+}
+
+pub async fn load_state() -> Result<AppState> {
+    let paths = init_config().await?;
+    let raw = fs::read_to_string(paths.state_file).await?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+pub async fn save_state(state: &AppState) -> Result<()> {
+    let paths = app_paths()?;
+    fs::create_dir_all(&paths.config_dir).await?;
+    let raw = serde_json::to_string_pretty(state)?;
+    fs::write(&paths.state_file, raw).await?;
+    Ok(())
+}
+
+pub async fn list_servers() -> Result<Vec<ServerConfig>> {
+    Ok(load_config().await?.servers)
+}
+
+pub async fn save_server(server: ServerConfig) -> Result<()> {
+    validate_name("server name", &server.name)?;
+    if server.host.trim().is_empty() {
+        return Err(AppError::msg("server host is required"));
+    }
+    if server.user.trim().is_empty() {
+        return Err(AppError::msg("server user is required"));
+    }
+
+    let mut config = load_config().await?;
+    if let Some(existing) = config
+        .servers
+        .iter_mut()
+        .find(|item| item.name == server.name)
+    {
+        *existing = server;
+    } else {
+        config.servers.push(server);
+    }
+    config
+        .servers
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    save_config(&config).await
+}
+
+pub async fn delete_server(name: String) -> Result<()> {
+    let mut config = load_config().await?;
+    config.servers.retain(|server| server.name != name);
+    save_config(&config).await
+}
+
+pub async fn save_defaults(defaults: Defaults) -> Result<()> {
+    let mut config = load_config().await?;
+    config.defaults = defaults;
+    save_config(&config).await
+}
+
+pub async fn list_tunnels() -> Result<Vec<TunnelState>> {
+    Ok(load_state().await?.tunnels)
+}
+
+pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
+    let config = load_config().await?;
+    let server = find_server(&config, &server_id)?.clone();
+    let mut result = ServerTestResult {
+        ssh_ok: false,
+        docker_ok: false,
+        socat_image_ok: false,
+        details: Vec::new(),
+    };
+
+    match run_ssh(&config.defaults, &server, "true").await {
+        Ok(_) => {
+            result.ssh_ok = true;
+            result.details.push("SSH connection succeeded".to_string());
+        }
+        Err(error) => {
+            result
+                .details
+                .push(format!("SSH connection failed: {error}"));
+            return Ok(result);
+        }
+    }
+
+    match run_ssh(
+        &config.defaults,
+        &server,
+        "docker version --format '{{.Server.Version}}'",
+    )
+    .await
+    {
+        Ok(output) => {
+            result.docker_ok = true;
+            result
+                .details
+                .push(format!("Docker is available: {}", output.trim()));
+        }
+        Err(error) => {
+            result.details.push(format!("Docker check failed: {error}"));
+            return Ok(result);
+        }
+    }
+
+    let image = server
+        .default_socat_image
+        .as_ref()
+        .unwrap_or(&config.defaults.socat_image);
+    let image_cmd = format!(
+        "docker image inspect {} >/dev/null 2>&1 || docker pull {} >/dev/null",
+        shell_quote(image),
+        shell_quote(image)
+    );
+    match run_ssh(&config.defaults, &server, &image_cmd).await {
+        Ok(_) => {
+            result.socat_image_ok = true;
+            result
+                .details
+                .push(format!("socat image is available: {image}"));
+        }
+        Err(error) => {
+            result
+                .details
+                .push(format!("socat image check failed for {image}: {error}"));
+        }
+    }
+
+    Ok(result)
+}
+
+pub async fn list_compose_projects(server_id: String) -> Result<Vec<ComposeProject>> {
+    let config = load_config().await?;
+    let server = find_server(&config, &server_id)?;
+    let format =
+        "{{.Label \"com.docker.compose.project\"}}\\t{{.Label \"com.docker.compose.service\"}}";
+    let command = format!("docker ps --format {}", shell_quote(format));
+    let output = run_ssh(&config.defaults, server, &command).await?;
+
+    let mut projects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in output.lines() {
+        let mut parts = line.split('\t');
+        let Some(project) = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(service) = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        projects
+            .entry(project.to_string())
+            .or_default()
+            .insert(service.to_string());
+    }
+
+    Ok(projects
+        .into_iter()
+        .map(|(project, services)| ComposeProject {
+            server: server_id.clone(),
+            project,
+            services: services.into_iter().collect(),
+        })
+        .collect())
+}
+
+pub async fn list_compose_services(
+    server_id: String,
+    project: String,
+) -> Result<Vec<ComposeService>> {
+    let config = load_config().await?;
+    let server = find_server(&config, &server_id)?;
+    let format = [
+        "{{.Label \"com.docker.compose.service\"}}",
+        "{{.Names}}",
+        "{{.Status}}",
+        "{{.Ports}}",
+        "{{.Image}}",
+        "{{.Networks}}",
+    ]
+    .join("\\t");
+    let command = format!(
+        "docker ps --filter label=com.docker.compose.project={} --format {}",
+        shell_quote(&project),
+        shell_quote(&format)
+    );
+    let output = run_ssh(&config.defaults, server, &command).await?;
+
+    let mut services = Vec::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        services.push(ComposeService {
+            service: parts[0].to_string(),
+            container: parts[1].to_string(),
+            status: parts[2].to_string(),
+            ports: parse_ports(parts[3]),
+            image: parts[4].to_string(),
+            networks: parts[5]
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+        });
+    }
+    services.sort_by(|left, right| left.service.cmp(&right.service));
+    Ok(services)
+}
+
+pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
+    validate_name("project", &request.project)?;
+    validate_name("service", &request.service)?;
+    if request.target_port == 0 {
+        return Err(AppError::msg("target port is required"));
+    }
+
+    let config = load_config().await?;
+    let server = find_server(&config, &request.server)?.clone();
+    let services = list_compose_services(request.server.clone(), request.project.clone()).await?;
+    let service = services
+        .iter()
+        .find(|item| item.service == request.service)
+        .ok_or_else(|| {
+            AppError::msg(format!(
+                "service {} was not found in project {}",
+                request.service, request.project
+            ))
+        })?;
+    let network = match request.network.clone() {
+        Some(network) => network,
+        None => choose_network(&request.project, service)?,
+    };
+
+    let socat_port = request.socat_port.unwrap_or(request.target_port);
+    let local_host = request
+        .local_host
+        .clone()
+        .unwrap_or_else(|| config.defaults.local_host.clone());
+    let local_port = match request.local_port {
+        Some(port) => {
+            ensure_local_port_available(&local_host, port)?;
+            port
+        }
+        None => portpicker::pick_unused_port()
+            .ok_or_else(|| AppError::msg("could not find an available local port"))?,
+    };
+    let image = request
+        .socat_image
+        .clone()
+        .or_else(|| server.default_socat_image.clone())
+        .unwrap_or_else(|| config.defaults.socat_image.clone());
+    let container = tunnel_container_name(
+        &server.name,
+        &request.project,
+        &request.service,
+        request.target_port,
+    );
+    let env_prefix = request
+        .env_prefix
+        .clone()
+        .or_else(|| Some(default_env_prefix(&request.service)));
+
+    ensure_socat_container(
+        &config.defaults,
+        &server,
+        &container,
+        &network,
+        &image,
+        &request.service,
+        request.target_port,
+        socat_port,
+    )
+    .await?;
+    let socat_container_ip =
+        inspect_container_ip(&config.defaults, &server, &container, &network).await?;
+    let child = spawn_ssh_forward(
+        &config.defaults,
+        &server,
+        &local_host,
+        local_port,
+        &socat_container_ip,
+        socat_port,
+    )
+    .await?;
+    let ssh_pid = child.id();
+
+    let state = TunnelState {
+        id: request.service.clone(),
+        server: request.server.clone(),
+        project: request.project.clone(),
+        service: request.service.clone(),
+        network,
+        target_port: request.target_port,
+        socat_port,
+        local_host,
+        local_port,
+        socat_container: container,
+        socat_container_ip,
+        ssh_pid,
+        status: TunnelStatus::Running,
+        mode: TunnelMode::SocatDirect,
+        env_prefix,
+        started_at: Some(now_string()),
+        last_error: None,
+    };
+
+    upsert_tunnel_state(state.clone()).await?;
+    Ok(state)
+}
+
+pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
+    let mut state = load_state().await?;
+    let config = load_config().await?;
+    let mut changed = false;
+
+    for tunnel in &mut state.tunnels {
+        if tunnel.id != tunnel_id {
+            continue;
+        }
+        if let Some(pid) = tunnel.ssh_pid {
+            kill_pid(pid).await?;
+        }
+        if let Ok(server) = find_server(&config, &tunnel.server) {
+            let command = format!(
+                "docker rm -f {} >/dev/null 2>&1 || true",
+                shell_quote(&tunnel.socat_container)
+            );
+            let _ = run_ssh(&config.defaults, server, &command).await;
+        }
+        tunnel.status = TunnelStatus::Stopped;
+        tunnel.ssh_pid = None;
+        changed = true;
+    }
+
+    if !changed {
+        return Err(AppError::msg(format!("tunnel {tunnel_id} was not found")));
+    }
+
+    save_state(&state).await
+}
+
+pub async fn close_all_tunnels() -> Result<()> {
+    let tunnels = load_state().await?.tunnels;
+    for tunnel in tunnels {
+        let _ = close_tunnel(tunnel.id).await;
+    }
+    Ok(())
+}
+
+pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
+    let config = load_config().await?;
+    let server = find_server(&config, &server_id)?;
+    let list_command =
+        "docker ps -a --filter name=^/compose-tunnel- --format '{{.Names}}'".to_string();
+    let output = run_ssh(&config.defaults, server, &list_command).await?;
+    let containers: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    if !containers.is_empty() {
+        let joined = containers
+            .iter()
+            .map(|container| shell_quote(container))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = format!("docker rm -f {joined}");
+        run_ssh(&config.defaults, server, &command).await?;
+    }
+
+    Ok(CleanupResult {
+        server: server_id,
+        containers,
+    })
+}
+
+pub async fn render_env(tunnel_id: String) -> Result<String> {
+    let state = load_state().await?;
+    let tunnel = state
+        .tunnels
+        .iter()
+        .find(|item| item.id == tunnel_id)
+        .ok_or_else(|| AppError::msg(format!("tunnel {tunnel_id} was not found")))?;
+    Ok(env_for_tunnel(tunnel))
+}
+
+pub async fn write_env_file(request: WriteEnvFileRequest) -> Result<()> {
+    let env = render_env(request.tunnel_id.clone()).await?;
+    write_managed_block(&request.path, &request.tunnel_id, &env).await
+}
+
+fn find_server<'a>(config: &'a AppConfig, name: &str) -> Result<&'a ServerConfig> {
+    config
+        .servers
+        .iter()
+        .find(|server| server.name == name)
+        .ok_or_else(|| AppError::msg(format!("server {name} was not found")))
+}
+
+fn validate_name(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(AppError::msg(format!("{label} is required")));
+    }
+    if value
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+    {
+        return Err(AppError::msg(format!(
+            "{label} may only contain letters, numbers, dashes, and underscores"
+        )));
+    }
+    Ok(())
+}
+
+fn ssh_target(server: &ServerConfig) -> String {
+    if let Some(alias) = server
+        .ssh_alias
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return alias.clone();
+    }
+    format!("{}@{}", server.user, server.host)
+}
+
+fn ssh_base_args(server: &ServerConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if server.ssh_alias.is_none() {
+        args.push("-p".to_string());
+        args.push(server.port.to_string());
+    }
+    if let Some(identity_file) = &server.identity_file {
+        args.push("-i".to_string());
+        args.push(expand_home(identity_file).to_string_lossy().to_string());
+    }
+    args.push("-o".to_string());
+    args.push("BatchMode=yes".to_string());
+    args.push("-o".to_string());
+    args.push("ExitOnForwardFailure=yes".to_string());
+    args.push(ssh_target(server));
+    args
+}
+
+async fn run_ssh(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    remote_command: &str,
+) -> Result<String> {
+    let mut args = ssh_base_args(server);
+    args.push(remote_command.to_string());
+    let output = Command::new(&defaults.ssh_binary)
+        .args(args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(AppError::msg(command_error(
+            "ssh",
+            output.status.code(),
+            &output.stderr,
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn spawn_ssh_forward(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    local_host: &str,
+    local_port: u16,
+    remote_host: &str,
+    remote_port: u16,
+) -> Result<Child> {
+    let mut args = ssh_base_args(server);
+    args.insert(0, "-N".to_string());
+    let forward = format!("{local_host}:{local_port}:{remote_host}:{remote_port}");
+    let target_index = args
+        .iter()
+        .position(|value| value == &ssh_target(server))
+        .ok_or_else(|| AppError::msg("could not build ssh forward command"))?;
+    args.insert(target_index, "-L".to_string());
+    args.insert(target_index + 1, forward);
+
+    let child = Command::new(&defaults.ssh_binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(child)
+}
+
+async fn ensure_socat_container(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    container: &str,
+    network: &str,
+    image: &str,
+    service: &str,
+    target_port: u16,
+    socat_port: u16,
+) -> Result<()> {
+    let inspect_command = format!("docker inspect {} >/dev/null 2>&1", shell_quote(container));
+    if run_ssh(defaults, server, &inspect_command).await.is_ok() {
+        return Ok(());
+    }
+
+    let listen = format!("TCP-LISTEN:{socat_port},fork,reuseaddr");
+    let target = format!("TCP:{service}:{target_port}");
+    let command = format!(
+        "docker run -d --rm --label compose-tunnel.managed=true --name {} --network {} {} {} {}",
+        shell_quote(container),
+        shell_quote(network),
+        shell_quote(image),
+        shell_quote(&listen),
+        shell_quote(&target)
+    );
+    run_ssh(defaults, server, &command).await?;
+    Ok(())
+}
+
+async fn inspect_container_ip(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    container: &str,
+    network: &str,
+) -> Result<String> {
+    let command = format!(
+        "docker inspect -f {} {}",
+        shell_quote(&format!(
+            "{{{{ index .NetworkSettings.Networks \"{network}\" \"IPAddress\" }}}}"
+        )),
+        shell_quote(container)
+    );
+    let output = run_ssh(defaults, server, &command).await?;
+    let ip = output.trim();
+    if ip.is_empty() || ip == "<no value>" {
+        return Err(AppError::msg(format!(
+            "could not inspect container IP for {container} on network {network}"
+        )));
+    }
+    Ok(ip.to_string())
+}
+
+fn choose_network(project: &str, service: &ComposeService) -> Result<String> {
+    let default_network = format!("{project}_default");
+    if service
+        .networks
+        .iter()
+        .any(|network| network == &default_network)
+    {
+        return Ok(default_network);
+    }
+    if service.networks.len() == 1 {
+        return Ok(service.networks[0].clone());
+    }
+    Err(AppError::msg(format!(
+        "service {} has multiple networks; pass --network",
+        service.service
+    )))
+}
+
+fn parse_ports(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn ensure_local_port_available(host: &str, port: u16) -> Result<()> {
+    TcpListener::bind((host, port))
+        .map(|_| ())
+        .map_err(|error| AppError::msg(format!("local port {host}:{port} is unavailable: {error}")))
+}
+
+fn tunnel_container_name(server: &str, project: &str, service: &str, target_port: u16) -> String {
+    format!(
+        "compose-tunnel-{}-{}-{}-{}",
+        sanitize_name(server),
+        sanitize_name(project),
+        sanitize_name(service),
+        target_port
+    )
+}
+
+fn sanitize_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn default_env_prefix(service: &str) -> String {
+    service
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn env_for_tunnel(tunnel: &TunnelState) -> String {
+    let prefix = tunnel
+        .env_prefix
+        .clone()
+        .unwrap_or_else(|| default_env_prefix(&tunnel.service));
+    format!(
+        "{prefix}_HOST={}\n{prefix}_PORT={}\n",
+        tunnel.local_host, tunnel.local_port
+    )
+}
+
+async fn write_managed_block(path: &Path, tunnel_id: &str, env: &str) -> Result<()> {
+    let start = format!("# compose-tunnel:start {tunnel_id}");
+    let end = format!("# compose-tunnel:end {tunnel_id}");
+    let block = format!("{start}\n{}{end}\n", env.trim_end());
+    let existing = match fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    let updated = replace_block(&existing, &start, &end, &block);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, updated).await?;
+    Ok(())
+}
+
+fn replace_block(existing: &str, start: &str, end: &str, block: &str) -> String {
+    let Some(start_index) = existing.find(start) else {
+        let separator = if existing.is_empty() || existing.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        return format!("{existing}{separator}{block}");
+    };
+    let Some(relative_end_index) = existing[start_index..].find(end) else {
+        let separator = if existing.ends_with('\n') { "" } else { "\n" };
+        return format!("{existing}{separator}{block}");
+    };
+    let end_index = start_index + relative_end_index + end.len();
+    let mut output = String::new();
+    output.push_str(&existing[..start_index]);
+    output.push_str(block);
+    if let Some(rest) = existing.get(end_index..) {
+        output.push_str(rest.strip_prefix('\n').unwrap_or(rest));
+    }
+    output
+}
+
+async fn upsert_tunnel_state(tunnel: TunnelState) -> Result<()> {
+    let mut state = load_state().await?;
+    if let Some(existing) = state.tunnels.iter_mut().find(|item| item.id == tunnel.id) {
+        *existing = tunnel;
+    } else {
+        state.tunnels.push(tunnel);
+    }
+    state.tunnels.sort_by(|left, right| left.id.cmp(&right.id));
+    save_state(&state).await
+}
+
+async fn kill_pid(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).output().await?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+            .await?;
+    }
+    Ok(())
+}
+
+fn command_error(command: &str, code: Option<i32>, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = mask_secrets(stderr.trim());
+    match code {
+        Some(code) => format!("{command} exited with code {code}: {stderr}"),
+        None => format!("{command} failed: {stderr}"),
+    }
+}
+
+pub fn mask_secrets(value: &str) -> String {
+    let mut output = Vec::new();
+    for token in value.split_whitespace() {
+        let lowered = token.to_ascii_lowercase();
+        if lowered.contains("password")
+            || lowered.contains("token")
+            || lowered.contains("secret")
+            || lowered.contains("private_key")
+        {
+            output.push("[masked]");
+        } else {
+            output.push(token);
+        }
+    }
+    output.join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    shell_words::quote(value).to_string()
+}
+
+fn expand_home(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+fn now_string() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs().to_string(),
+        Err(_) => "0".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_managed_block_keeps_other_content() {
+        let existing = "A=1\n# compose-tunnel:start db\nOLD=1\n# compose-tunnel:end db\nB=2\n";
+        let updated = replace_block(
+            existing,
+            "# compose-tunnel:start db",
+            "# compose-tunnel:end db",
+            "# compose-tunnel:start db\nDB_HOST=127.0.0.1\n# compose-tunnel:end db\n",
+        );
+
+        assert_eq!(
+            updated,
+            "A=1\n# compose-tunnel:start db\nDB_HOST=127.0.0.1\n# compose-tunnel:end db\nB=2\n"
+        );
+    }
+
+    #[test]
+    fn env_prefix_is_upper_snake() {
+        assert_eq!(default_env_prefix("my-db"), "MY_DB");
+    }
+}

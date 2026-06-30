@@ -1,0 +1,16 @@
+[package]
+name = "compose-tunnel-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "compose-tunnel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+compose-tunnel-core = { path = "../compose-tunnel-core" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
