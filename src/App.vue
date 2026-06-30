@@ -18,6 +18,7 @@ type ServerConfig = {
   identity_file?: string | null;
   ssh_alias?: string | null;
   default_socat_image?: string | null;
+  docker_command: string;
 };
 
 type ComposeProject = {
@@ -80,6 +81,7 @@ const selectedProject = ref("");
 const selectedTunnel = ref("");
 const envPreview = ref("");
 const envPath = ref(".env.local");
+const editingServerName = ref("");
 
 const serverForm = reactive<ServerConfig>({
   name: "",
@@ -89,6 +91,7 @@ const serverForm = reactive<ServerConfig>({
   identity_file: "",
   ssh_alias: "",
   default_socat_image: "",
+  docker_command: "docker",
 });
 
 const tunnelForm = reactive({
@@ -104,6 +107,24 @@ const tunnelForm = reactive({
 
 const runningCount = computed(() => tunnels.value.filter((item) => item.status === "running").length);
 const stoppedCount = computed(() => tunnels.value.filter((item) => item.status !== "running").length);
+const dockerCommandPreset = computed(() => {
+  if (serverForm.docker_command === "docker") {
+    return "docker";
+  }
+  if (serverForm.docker_command === "sudo -n docker") {
+    return "sudo -n docker";
+  }
+  return "custom";
+});
+const tunnelProjectOptions = computed(() =>
+  projects.value.filter((project) => project.server === tunnelForm.server),
+);
+const tunnelServiceOptions = computed(() =>
+  services.value.filter(() => selectedServer.value === tunnelForm.server && selectedProject.value === tunnelForm.project),
+);
+const selectedTunnelService = computed(
+  () => tunnelServiceOptions.value.find((service) => service.service === tunnelForm.service) ?? null,
+);
 
 function setTab(tab: Tab) {
   activeTab.value = tab;
@@ -165,7 +186,11 @@ async function refreshTunnels() {
 
 async function saveServer() {
   await runTask(`Saved server ${serverForm.name}`, async () => {
-    await invoke("save_server", { server: compactServer(serverForm) });
+    const server = compactServer(serverForm);
+    if (editingServerName.value && editingServerName.value !== server.name) {
+      await invoke("delete_server", { name: editingServerName.value });
+    }
+    await invoke("save_server", { server });
     clearServerForm();
     await refreshServers();
   });
@@ -187,6 +212,28 @@ async function testServer(name: string) {
   }
 }
 
+function editServer(server: ServerConfig) {
+  editingServerName.value = server.name;
+  Object.assign(serverForm, {
+    name: server.name,
+    host: server.host,
+    port: server.port,
+    user: server.user,
+    identity_file: server.identity_file ?? "",
+    ssh_alias: server.ssh_alias ?? "",
+    default_socat_image: server.default_socat_image ?? "",
+    docker_command: server.docker_command || "docker",
+  });
+  notice.value = `Editing server ${server.name}`;
+  error.value = "";
+}
+
+function applyDockerCommandPreset(value: string) {
+  if (value === "docker" || value === "sudo -n docker") {
+    serverForm.docker_command = value;
+  }
+}
+
 async function discoverProjects() {
   if (!selectedServer.value) {
     error.value = "Select a server first";
@@ -197,18 +244,13 @@ async function discoverProjects() {
   );
   if (result) {
     projects.value = result;
-    if (result.length > 0) {
-      selectedProject.value = result[0].project;
-      tunnelForm.server = selectedServer.value;
-      tunnelForm.project = result[0].project;
-      await loadServices(result[0].project);
-    }
+    services.value = [];
+    selectedProject.value = "";
   }
 }
 
 async function loadServices(project: string) {
   selectedProject.value = project;
-  tunnelForm.project = project;
   const result = await runTask(`Loaded services for ${project}`, async () =>
     invoke<ComposeService[]>("list_compose_services", {
       serverId: selectedServer.value,
@@ -217,15 +259,15 @@ async function loadServices(project: string) {
   );
   if (result) {
     services.value = result;
-    if (result.length > 0) {
-      pickService(result[0]);
-    }
   }
 }
 
 function pickService(service: ComposeService) {
+  tunnelForm.server = selectedServer.value;
+  tunnelForm.project = selectedProject.value;
   tunnelForm.service = service.service;
   tunnelForm.network = service.networks[0] ?? "";
+  tunnelForm.local_port = "";
   const port = inferPort(service);
   if (port) {
     tunnelForm.target_port = port;
@@ -249,8 +291,48 @@ async function openTunnel() {
         env_prefix: optional(tunnelForm.env_prefix),
       },
     });
+    tunnelForm.local_port = "";
     await refreshTunnels();
   });
+}
+
+async function onTunnelServerChange() {
+  selectedServer.value = tunnelForm.server;
+  tunnelForm.project = "";
+  tunnelForm.service = "";
+  tunnelForm.network = "";
+  services.value = [];
+  if (tunnelForm.server) {
+    const result = await runTask(`Discovered projects on ${tunnelForm.server}`, async () =>
+      invoke<ComposeProject[]>("list_compose_projects", { serverId: tunnelForm.server }),
+    );
+    if (result) {
+      projects.value = result;
+    }
+  }
+}
+
+async function onTunnelProjectChange() {
+  selectedServer.value = tunnelForm.server;
+  selectedProject.value = tunnelForm.project;
+  tunnelForm.service = "";
+  tunnelForm.network = "";
+  if (tunnelForm.server && tunnelForm.project) {
+    await loadServices(tunnelForm.project);
+  }
+}
+
+function onTunnelServiceChange() {
+  const service = selectedTunnelService.value;
+  if (!service) {
+    tunnelForm.network = "";
+    return;
+  }
+  tunnelForm.network = service.networks[0] ?? "";
+  const port = inferPort(service);
+  if (port) {
+    tunnelForm.target_port = port;
+  }
 }
 
 async function closeTunnel(id: string) {
@@ -295,6 +377,7 @@ async function saveDefaultSettings() {
 }
 
 function clearServerForm() {
+  editingServerName.value = "";
   Object.assign(serverForm, {
     name: "",
     host: "",
@@ -303,6 +386,7 @@ function clearServerForm() {
     identity_file: "",
     ssh_alias: "",
     default_socat_image: "",
+    docker_command: "docker",
   });
 }
 
@@ -315,6 +399,7 @@ function compactServer(server: ServerConfig): ServerConfig {
     identity_file: optional(server.identity_file),
     ssh_alias: optional(server.ssh_alias),
     default_socat_image: optional(server.default_socat_image),
+    docker_command: server.docker_command.trim() || "docker",
   };
 }
 
@@ -331,6 +416,11 @@ function inferPort(service: ComposeService) {
 
 function statusClass(status: string) {
   return status === "running" ? "tag tag-running" : status === "error" ? "tag tag-error" : "tag";
+}
+
+function onDockerModeChange(event: Event) {
+  const target = event.target as HTMLSelectElement;
+  applyDockerCommandPreset(target.value);
 }
 
 onMounted(bootstrap);
@@ -409,26 +499,40 @@ onMounted(bootstrap);
 
       <section v-if="activeTab === 'Servers'" class="page split">
         <form class="panel form" @submit.prevent="saveServer">
-          <h3>Server</h3>
+          <h3>{{ editingServerName ? `Edit ${editingServerName}` : 'Server' }}</h3>
           <label>Name<input v-model="serverForm.name" required /></label>
           <label>Host<input v-model="serverForm.host" required /></label>
           <label>User<input v-model="serverForm.user" required /></label>
           <label>Port<input v-model.number="serverForm.port" type="number" min="1" /></label>
           <label>Identity file<input v-model="serverForm.identity_file" placeholder="~/.ssh/id_ed25519" /></label>
           <label>SSH config alias<input v-model="serverForm.ssh_alias" placeholder="staging" /></label>
+          <label>
+            Docker mode
+            <select :value="dockerCommandPreset" @change="onDockerModeChange">
+              <option value="docker">docker</option>
+              <option value="sudo -n docker">sudo -n docker</option>
+              <option value="custom">custom</option>
+            </select>
+          </label>
+          <label>Docker command<input v-model="serverForm.docker_command" required /></label>
           <label>Default socat image<input v-model="serverForm.default_socat_image" placeholder="alpine/socat:latest" /></label>
-          <div class="toolbar"><button class="primary" type="submit">Save</button><button type="button" @click="clearServerForm">Clear</button></div>
+          <div class="toolbar">
+            <button class="primary" type="submit">{{ editingServerName ? 'Update' : 'Save' }}</button>
+            <button type="button" @click="clearServerForm">{{ editingServerName ? 'Cancel' : 'Clear' }}</button>
+          </div>
         </form>
         <div class="panel">
           <h3>Servers</h3>
           <table>
-            <thead><tr><th>Name</th><th>Host</th><th>User</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Name</th><th>Host</th><th>User</th><th>Docker</th><th>Actions</th></tr></thead>
             <tbody>
               <tr v-for="server in servers" :key="server.name">
                 <td>{{ server.name }}</td>
                 <td>{{ server.host }}:{{ server.port }}</td>
                 <td>{{ server.user }}</td>
+                <td>{{ server.docker_command }}</td>
                 <td class="actions">
+                  <button type="button" title="Edit" @click="editServer(server)">Edit</button>
                   <button type="button" title="Test" @click="testServer(server.name)">Test</button>
                   <button type="button" title="Delete" @click="deleteServer(server.name)">Delete</button>
                 </td>
@@ -472,13 +576,40 @@ onMounted(bootstrap);
       <section v-if="activeTab === 'Tunnels'" class="page split">
         <form class="panel form" @submit.prevent="openTunnel">
           <h3>Create Tunnel</h3>
-          <label>Server<input v-model="tunnelForm.server" list="servers-list" required /></label>
-          <datalist id="servers-list"><option v-for="server in servers" :key="server.name" :value="server.name" /></datalist>
-          <label>Project<input v-model="tunnelForm.project" required /></label>
-          <label>Service<input v-model="tunnelForm.service" required /></label>
-          <label>Network<input v-model="tunnelForm.network" placeholder="myapp_default" /></label>
+          <label>
+            Server
+            <select v-model="tunnelForm.server" required @change="onTunnelServerChange">
+              <option value="" disabled>Select server</option>
+              <option v-for="server in servers" :key="server.name" :value="server.name">{{ server.name }}</option>
+            </select>
+          </label>
+          <label>
+            Project
+            <select v-model="tunnelForm.project" required @change="onTunnelProjectChange">
+              <option value="" disabled>Select project</option>
+              <option v-for="project in tunnelProjectOptions" :key="project.project" :value="project.project">
+                {{ project.project }}
+              </option>
+            </select>
+          </label>
+          <label>
+            Service container
+            <select v-model="tunnelForm.service" required @change="onTunnelServiceChange">
+              <option value="" disabled>Select service</option>
+              <option v-for="service in tunnelServiceOptions" :key="service.container" :value="service.service">
+                {{ service.service }} · {{ service.container }}
+              </option>
+            </select>
+          </label>
+          <label>
+            Network
+            <select v-if="selectedTunnelService" v-model="tunnelForm.network">
+              <option v-for="network in selectedTunnelService.networks" :key="network" :value="network">{{ network }}</option>
+            </select>
+            <input v-else v-model="tunnelForm.network" placeholder="myapp_default" />
+          </label>
           <label>Target port<input v-model.number="tunnelForm.target_port" type="number" min="1" required /></label>
-          <label>Local port<input v-model="tunnelForm.local_port" placeholder="auto" /></label>
+          <label>Local port<input v-model="tunnelForm.local_port" placeholder="auto assign" /></label>
           <label>Env prefix<input v-model="tunnelForm.env_prefix" placeholder="DATABASE" /></label>
           <label>socat image<input v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
           <button class="primary" type="submit">Start</button>

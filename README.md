@@ -22,6 +22,7 @@
 ```bash
 cargo run -p compose-tunnel-cli -- init
 cargo run -p compose-tunnel-cli -- server add staging --host staging.example.com --user deploy
+cargo run -p compose-tunnel-cli -- server add staging-sudo --host staging.example.com --user deploy --docker-command "sudo -n docker"
 cargo run -p compose-tunnel-cli -- server test staging
 cargo run -p compose-tunnel-cli -- compose list --server staging
 cargo run -p compose-tunnel-cli -- compose services --server staging --project myapp
@@ -34,8 +35,8 @@ cargo run -p compose-tunnel-cli -- close db
 ## Run The Desktop App
 
 ```bash
-npm install
-npm run tauri dev
+pnpm install
+pnpm tauri dev
 ```
 
 ## Verify
@@ -43,9 +44,9 @@ npm run tauri dev
 ```bash
 cargo check --workspace
 cargo test -p compose-tunnel-core
-npm run build
+pnpm build
 ```
 
 ## Notes
 
-The MVP uses the system `ssh` binary so existing SSH config, keys, agents, and ProxyJump rules continue to work. Remote Docker access is performed by running `docker` over SSH.
+The MVP uses the system `ssh` binary so existing SSH config, keys, agents, and ProxyJump rules continue to work. Remote Docker access is performed by the per-server Docker command, which defaults to `docker` and can be set to `sudo -n docker` or another custom command.

@@ -113,10 +113,16 @@ pub struct ServerConfig {
     pub ssh_alias: Option<String>,
     #[serde(default)]
     pub default_socat_image: Option<String>,
+    #[serde(default = "default_docker_command")]
+    pub docker_command: String,
 }
 
 fn default_ssh_port() -> u16 {
     22
+}
+
+fn default_docker_command() -> String {
+    "docker".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -332,6 +338,11 @@ pub async fn save_server(server: ServerConfig) -> Result<()> {
         return Err(AppError::msg("server user is required"));
     }
 
+    let mut server = server;
+    if server.docker_command.trim().is_empty() {
+        server.docker_command = default_docker_command();
+    }
+
     let mut config = load_config().await?;
     if let Some(existing) = config
         .servers
@@ -387,18 +398,14 @@ pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
         }
     }
 
-    match run_ssh(
-        &config.defaults,
-        &server,
-        "docker version --format '{{.Server.Version}}'",
-    )
-    .await
-    {
+    let docker = docker_command(&server);
+    let version_command = format!("{docker} version --format '{{{{.Server.Version}}}}'");
+    match run_ssh(&config.defaults, &server, &version_command).await {
         Ok(output) => {
             result.docker_ok = true;
             result
                 .details
-                .push(format!("Docker is available: {}", output.trim()));
+                .push(format!("{docker} is available: {}", output.trim()));
         }
         Err(error) => {
             result.details.push(format!("Docker check failed: {error}"));
@@ -411,7 +418,7 @@ pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
         .as_ref()
         .unwrap_or(&config.defaults.socat_image);
     let image_cmd = format!(
-        "docker image inspect {} >/dev/null 2>&1 || docker pull {} >/dev/null",
+        "{docker} image inspect {} >/dev/null 2>&1 || {docker} pull {} >/dev/null",
         shell_quote(image),
         shell_quote(image)
     );
@@ -437,7 +444,11 @@ pub async fn list_compose_projects(server_id: String) -> Result<Vec<ComposeProje
     let server = find_server(&config, &server_id)?;
     let format =
         "{{.Label \"com.docker.compose.project\"}}\\t{{.Label \"com.docker.compose.service\"}}";
-    let command = format!("docker ps --format {}", shell_quote(format));
+    let command = format!(
+        "{} ps --format {}",
+        docker_command(server),
+        shell_quote(format)
+    );
     let output = run_ssh(&config.defaults, server, &command).await?;
 
     let mut projects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -489,7 +500,8 @@ pub async fn list_compose_services(
     ]
     .join("\\t");
     let command = format!(
-        "docker ps --filter label=com.docker.compose.project={} --format {}",
+        "{} ps --filter label=com.docker.compose.project={} --format {}",
+        docker_command(server),
         shell_quote(&project),
         shell_quote(&format)
     );
@@ -634,7 +646,8 @@ pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
         }
         if let Ok(server) = find_server(&config, &tunnel.server) {
             let command = format!(
-                "docker rm -f {} >/dev/null 2>&1 || true",
+                "{} rm -f {} >/dev/null 2>&1 || true",
+                docker_command(server),
                 shell_quote(&tunnel.socat_container)
             );
             let _ = run_ssh(&config.defaults, server, &command).await;
@@ -662,8 +675,10 @@ pub async fn close_all_tunnels() -> Result<()> {
 pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
     let config = load_config().await?;
     let server = find_server(&config, &server_id)?;
-    let list_command =
-        "docker ps -a --filter name=^/compose-tunnel- --format '{{.Names}}'".to_string();
+    let list_command = format!(
+        "{} ps -a --filter name=^/compose-tunnel- --format '{{{{.Names}}}}'",
+        docker_command(server)
+    );
     let output = run_ssh(&config.defaults, server, &list_command).await?;
     let containers: Vec<String> = output
         .lines()
@@ -678,7 +693,7 @@ pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
             .map(|container| shell_quote(container))
             .collect::<Vec<_>>()
             .join(" ");
-        let command = format!("docker rm -f {joined}");
+        let command = format!("{} rm -f {joined}", docker_command(server));
         run_ssh(&config.defaults, server, &command).await?;
     }
 
@@ -735,6 +750,15 @@ fn ssh_target(server: &ServerConfig) -> String {
         return alias.clone();
     }
     format!("{}@{}", server.user, server.host)
+}
+
+fn docker_command(server: &ServerConfig) -> String {
+    let value = server.docker_command.trim();
+    if value.is_empty() {
+        default_docker_command()
+    } else {
+        value.to_string()
+    }
 }
 
 fn ssh_base_args(server: &ServerConfig) -> Vec<String> {
@@ -813,7 +837,11 @@ async fn ensure_socat_container(
     target_port: u16,
     socat_port: u16,
 ) -> Result<()> {
-    let inspect_command = format!("docker inspect {} >/dev/null 2>&1", shell_quote(container));
+    let docker = docker_command(server);
+    let inspect_command = format!(
+        "{docker} inspect {} >/dev/null 2>&1",
+        shell_quote(container)
+    );
     if run_ssh(defaults, server, &inspect_command).await.is_ok() {
         return Ok(());
     }
@@ -821,7 +849,7 @@ async fn ensure_socat_container(
     let listen = format!("TCP-LISTEN:{socat_port},fork,reuseaddr");
     let target = format!("TCP:{service}:{target_port}");
     let command = format!(
-        "docker run -d --rm --label compose-tunnel.managed=true --name {} --network {} {} {} {}",
+        "{docker} run -d --rm --label compose-tunnel.managed=true --name {} --network {} {} {} {}",
         shell_quote(container),
         shell_quote(network),
         shell_quote(image),
@@ -838,8 +866,9 @@ async fn inspect_container_ip(
     container: &str,
     network: &str,
 ) -> Result<String> {
+    let docker = docker_command(server);
     let command = format!(
-        "docker inspect -f {} {}",
+        "{docker} inspect -f {} {}",
         shell_quote(&format!(
             "{{{{ index .NetworkSettings.Networks \"{network}\" \"IPAddress\" }}}}"
         )),
@@ -1070,5 +1099,22 @@ mod tests {
     #[test]
     fn env_prefix_is_upper_snake() {
         assert_eq!(default_env_prefix("my-db"), "MY_DB");
+    }
+
+    #[test]
+    fn old_server_config_defaults_to_docker_command() {
+        let raw = r#"
+            [defaults]
+
+            [[servers]]
+            name = "staging"
+            host = "staging.example.com"
+            port = 22
+            user = "deploy"
+        "#;
+
+        let config: AppConfig = toml::from_str(raw).expect("config should parse");
+
+        assert_eq!(config.servers[0].docker_command, "docker");
     }
 }

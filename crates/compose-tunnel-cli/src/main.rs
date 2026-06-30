@@ -59,6 +59,8 @@ struct ServerAddArgs {
     ssh_alias: Option<String>,
     #[arg(long)]
     socat_image: Option<String>,
+    #[arg(long, default_value = "docker")]
+    docker_command: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -224,19 +226,21 @@ async fn handle_server(command: ServerCommand) -> anyhow::Result<()> {
                 identity_file: args.identity_file,
                 ssh_alias: args.ssh_alias,
                 default_socat_image: args.socat_image,
+                docker_command: args.docker_command,
             })
             .await?;
             println!("Saved server {}", args.name);
         }
         ServerCommand::List => {
-            println!("NAME\tHOST\tPORT\tUSER\tSSH ALIAS");
+            println!("NAME\tHOST\tPORT\tUSER\tDOCKER\tSSH ALIAS");
             for server in list_servers().await? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     server.name,
                     server.host,
                     server.port,
                     server.user,
+                    server.docker_command,
                     server.ssh_alias.unwrap_or_default()
                 );
             }
