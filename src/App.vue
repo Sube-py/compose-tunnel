@@ -73,8 +73,6 @@ type Tab = (typeof tabs)[number];
 const toast = useToast();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
-const notice = ref("");
-const error = ref("");
 const logs = ref<string[]>([]);
 const configDir = ref("");
 const defaults = reactive<Defaults>({
@@ -147,8 +145,6 @@ const selectedTunnelService = computed(
 
 function setTab(tab: Tab) {
   activeTab.value = tab;
-  error.value = "";
-  notice.value = "";
 }
 
 function log(message: string) {
@@ -156,18 +152,17 @@ function log(message: string) {
   logs.value = logs.value.slice(0, 80);
 }
 
-async function runTask<T>(message: string, task: () => Promise<T>): Promise<T | null> {
+async function runTask<T>(message: string, task: () => Promise<T>, showSuccessToast = true): Promise<T | null> {
   loading.value = true;
-  error.value = "";
-  notice.value = "";
   try {
     const result = await task();
-    notice.value = message;
     log(message);
+    if (showSuccessToast) {
+      toast.add({ severity: "success", summary: message, life: 2600 });
+    }
     return result;
   } catch (caught) {
     const text = caught instanceof Error ? caught.message : String(caught);
-    error.value = text;
     log(`Error: ${text}`);
     toast.add({ severity: "error", summary: "Operation failed", detail: text, life: 5000 });
     return null;
@@ -226,6 +221,7 @@ async function deleteServer(name: string) {
 async function testServer(name: string) {
   const result = await runTask(`Tested server ${name}`, async () =>
     invoke<{ details: string[] }>("test_server", { serverId: name }),
+    false,
   );
   if (result) {
     logs.value.unshift(...result.details.map((detail) => `${new Date().toLocaleTimeString()} ${detail}`));
@@ -251,8 +247,7 @@ function editServer(server: ServerConfig) {
     default_socat_image: server.default_socat_image ?? "",
     docker_command: server.docker_command || "docker",
   });
-  notice.value = `Editing server ${server.name}`;
-  error.value = "";
+  toast.add({ severity: "info", summary: `Editing server ${server.name}`, life: 2200 });
 }
 
 function applyDockerCommandPreset(value: string) {
@@ -263,7 +258,7 @@ function applyDockerCommandPreset(value: string) {
 
 async function discoverProjects() {
   if (!selectedServer.value) {
-    error.value = "Select a server first";
+    toast.add({ severity: "warn", summary: "Select a server first", life: 3000 });
     return;
   }
   const result = await runTask(`Discovered projects on ${selectedServer.value}`, async () =>
@@ -391,7 +386,7 @@ async function startTunnel(tunnel: TunnelState) {
 
 async function renderEnv() {
   if (!selectedTunnel.value) {
-    error.value = "Select a tunnel first";
+    toast.add({ severity: "warn", summary: "Select a tunnel first", life: 3000 });
     return;
   }
   const result = await runTask(`Rendered env for ${selectedTunnel.value}`, async () =>
@@ -404,7 +399,7 @@ async function renderEnv() {
 
 async function writeEnv() {
   if (!selectedTunnel.value) {
-    error.value = "Select a tunnel first";
+    toast.add({ severity: "warn", summary: "Select a tunnel first", life: 3000 });
     return;
   }
   await runTask(`Wrote env block to ${envPath.value}`, async () => {
@@ -512,9 +507,6 @@ onMounted(bootstrap);
           </div>
           <Button label="Refresh" icon="pi pi-refresh" :loading="loading" @click="refreshTunnels" />
         </header>
-
-      <div v-if="notice" class="notice">{{ notice }}</div>
-      <div v-if="error" class="error">{{ error }}</div>
 
       <section v-if="activeTab === 'Dashboard'" class="page">
         <div class="metrics">

@@ -204,25 +204,6 @@ nav {
   justify-content: space-between;
 }
 
-.notice,
-.error {
-  margin-bottom: 14px;
-  padding: 10px 12px;
-  border-radius: 6px;
-}
-
-.notice {
-  border: 1px solid #b7dbd0;
-  background: #e9f7f2;
-  color: #185b4d;
-}
-
-.error {
-  border: 1px solid #e8b4ad;
-  background: #fff0ed;
-  color: #9c2f20;
-}
-
 .metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
