@@ -1,6 +1,17 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { useToast } from "primevue/usetoast";
+import Button from "primevue/button";
+import Card from "primevue/card";
+import Column from "primevue/column";
+import DataTable from "primevue/datatable";
+import InputNumber from "primevue/inputnumber";
+import InputText from "primevue/inputtext";
+import ScrollPanel from "primevue/scrollpanel";
+import Select from "primevue/select";
+import Tag from "primevue/tag";
+import Toast from "primevue/toast";
 
 type Defaults = {
   local_host: string;
@@ -59,6 +70,7 @@ type TunnelState = {
 const tabs = ["Dashboard", "Servers", "Compose", "Tunnels", "Env", "Logs", "Settings"] as const;
 type Tab = (typeof tabs)[number];
 
+const toast = useToast();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
 const notice = ref("");
@@ -116,6 +128,13 @@ const dockerCommandPreset = computed(() => {
   }
   return "custom";
 });
+const dockerModeOptions = [
+  { label: "docker", value: "docker" },
+  { label: "sudo -n docker", value: "sudo -n docker" },
+  { label: "custom", value: "custom" },
+];
+const serverOptions = computed(() => servers.value.map((server) => ({ label: server.name, value: server.name })));
+const tunnelOptions = computed(() => tunnels.value.map((tunnel) => ({ label: tunnel.id, value: tunnel.id })));
 const tunnelProjectOptions = computed(() =>
   projects.value.filter((project) => project.server === tunnelForm.server),
 );
@@ -150,6 +169,7 @@ async function runTask<T>(message: string, task: () => Promise<T>): Promise<T | 
     const text = caught instanceof Error ? caught.message : String(caught);
     error.value = text;
     log(`Error: ${text}`);
+    toast.add({ severity: "error", summary: "Operation failed", detail: text, life: 5000 });
     return null;
   } finally {
     loading.value = false;
@@ -209,6 +229,13 @@ async function testServer(name: string) {
   );
   if (result) {
     logs.value.unshift(...result.details.map((detail) => `${new Date().toLocaleTimeString()} ${detail}`));
+    const ok = result.details.length > 0 && !result.details.some((detail) => detail.toLowerCase().includes("failed"));
+    toast.add({
+      severity: ok ? "success" : "error",
+      summary: ok ? "Connection test passed" : "Connection test failed",
+      detail: result.details.join(" | "),
+      life: ok ? 3500 : 7000,
+    });
   }
 }
 
@@ -342,6 +369,26 @@ async function closeTunnel(id: string) {
   });
 }
 
+async function startTunnel(tunnel: TunnelState) {
+  await runTask(`Started tunnel ${tunnel.id}`, async () => {
+    await invoke("open_tunnel", {
+      request: {
+        server: tunnel.server,
+        project: tunnel.project,
+        service: tunnel.service,
+        target_port: tunnel.target_port,
+        network: tunnel.network,
+        local_port: null,
+        local_host: tunnel.local_host || defaults.local_host,
+        socat_port: tunnel.socat_port,
+        socat_image: null,
+        env_prefix: tunnel.env_prefix,
+      },
+    });
+    await refreshTunnels();
+  });
+}
+
 async function renderEnv() {
   if (!selectedTunnel.value) {
     error.value = "Select a tunnel first";
@@ -414,13 +461,18 @@ function inferPort(service: ComposeService) {
   return match ? Number(match[1]) : null;
 }
 
-function statusClass(status: string) {
-  return status === "running" ? "tag tag-running" : status === "error" ? "tag tag-error" : "tag";
+function statusSeverity(status: string) {
+  if (status === "running") {
+    return "success";
+  }
+  if (status === "error") {
+    return "danger";
+  }
+  return "secondary";
 }
 
-function onDockerModeChange(event: Event) {
-  const target = event.target as HTMLSelectElement;
-  applyDockerCommandPreset(target.value);
+function onDockerModeChange(value: string) {
+  applyDockerCommandPreset(value);
 }
 
 onMounted(bootstrap);
@@ -428,6 +480,7 @@ onMounted(bootstrap);
 
 <template>
   <main class="shell">
+    <Toast position="top-right" />
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark">CT</span>
@@ -437,140 +490,127 @@ onMounted(bootstrap);
         </div>
       </div>
       <nav>
-        <button
+        <Button
           v-for="tab in tabs"
           :key="tab"
+          :label="tab"
           :class="{ active: activeTab === tab }"
           type="button"
+          text
           @click="setTab(tab)"
-        >
-          {{ tab }}
-        </button>
+        />
       </nav>
       <div class="config-path">{{ configDir }}</div>
     </aside>
 
-    <section class="workspace">
-      <header class="topbar">
-        <div>
-          <h2>{{ activeTab }}</h2>
-          <p>{{ runningCount }} running tunnels, {{ stoppedCount }} stopped</p>
-        </div>
-        <button class="primary" type="button" :disabled="loading" @click="refreshTunnels">Refresh</button>
-      </header>
+    <ScrollPanel class="workspace-scroll">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h2>{{ activeTab }}</h2>
+            <p>{{ runningCount }} running tunnels, {{ stoppedCount }} stopped</p>
+          </div>
+          <Button label="Refresh" icon="pi pi-refresh" :loading="loading" @click="refreshTunnels" />
+        </header>
 
       <div v-if="notice" class="notice">{{ notice }}</div>
       <div v-if="error" class="error">{{ error }}</div>
 
       <section v-if="activeTab === 'Dashboard'" class="page">
         <div class="metrics">
-          <article>
-            <span>Running</span>
-            <strong>{{ runningCount }}</strong>
-          </article>
-          <article>
-            <span>Servers</span>
-            <strong>{{ servers.length }}</strong>
-          </article>
-          <article>
-            <span>Projects</span>
-            <strong>{{ projects.length }}</strong>
-          </article>
+          <Card>
+            <template #content><span>Running</span><strong>{{ runningCount }}</strong></template>
+          </Card>
+          <Card>
+            <template #content><span>Servers</span><strong>{{ servers.length }}</strong></template>
+          </Card>
+          <Card>
+            <template #content><span>Projects</span><strong>{{ projects.length }}</strong></template>
+          </Card>
         </div>
         <div class="toolbar">
-          <button type="button" @click="setTab('Servers')">Add Server</button>
-          <button type="button" @click="setTab('Compose')">Discover Compose</button>
-          <button type="button" @click="setTab('Tunnels')">Open Tunnel</button>
+          <Button label="Add Server" icon="pi pi-server" outlined @click="setTab('Servers')" />
+          <Button label="Discover Compose" icon="pi pi-search" outlined @click="setTab('Compose')" />
+          <Button label="Open Tunnel" icon="pi pi-share-alt" outlined @click="setTab('Tunnels')" />
         </div>
-        <table>
-          <thead>
-            <tr><th>ID</th><th>Service</th><th>Local</th><th>Status</th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="tunnel in tunnels" :key="tunnel.id">
-              <td>{{ tunnel.id }}</td>
-              <td>{{ tunnel.project }}/{{ tunnel.service }}:{{ tunnel.target_port }}</td>
-              <td>{{ tunnel.local_host }}:{{ tunnel.local_port }}</td>
-              <td><span :class="statusClass(tunnel.status)">{{ tunnel.status }}</span></td>
-            </tr>
-          </tbody>
-        </table>
+        <DataTable :value="tunnels" size="small" stripedRows>
+          <Column field="id" header="ID" />
+          <Column header="Service">
+            <template #body="{ data }">{{ data.project }}/{{ data.service }}:{{ data.target_port }}</template>
+          </Column>
+          <Column header="Local">
+            <template #body="{ data }">{{ data.local_host }}:{{ data.local_port }}</template>
+          </Column>
+          <Column header="Status">
+            <template #body="{ data }"><Tag :value="data.status" :severity="statusSeverity(data.status)" /></template>
+          </Column>
+        </DataTable>
       </section>
 
       <section v-if="activeTab === 'Servers'" class="page split">
         <form class="panel form" @submit.prevent="saveServer">
           <h3>{{ editingServerName ? `Edit ${editingServerName}` : 'Server' }}</h3>
-          <label>Name<input v-model="serverForm.name" required /></label>
-          <label>Host<input v-model="serverForm.host" required /></label>
-          <label>User<input v-model="serverForm.user" required /></label>
-          <label>Port<input v-model.number="serverForm.port" type="number" min="1" /></label>
-          <label>Identity file<input v-model="serverForm.identity_file" placeholder="~/.ssh/id_ed25519" /></label>
-          <label>SSH config alias<input v-model="serverForm.ssh_alias" placeholder="staging" /></label>
+          <label>Name<InputText v-model="serverForm.name" required /></label>
+          <label>Host<InputText v-model="serverForm.host" required /></label>
+          <label>User<InputText v-model="serverForm.user" required /></label>
+          <label>Port<InputNumber v-model="serverForm.port" :min="1" :useGrouping="false" fluid /></label>
+          <label>Identity file<InputText v-model="serverForm.identity_file" placeholder="~/.ssh/id_ed25519" /></label>
+          <label>SSH config alias<InputText v-model="serverForm.ssh_alias" placeholder="staging" /></label>
           <label>
             Docker mode
-            <select :value="dockerCommandPreset" @change="onDockerModeChange">
-              <option value="docker">docker</option>
-              <option value="sudo -n docker">sudo -n docker</option>
-              <option value="custom">custom</option>
-            </select>
+            <Select :modelValue="dockerCommandPreset" :options="dockerModeOptions" optionLabel="label" optionValue="value" @update:modelValue="onDockerModeChange" />
           </label>
-          <label>Docker command<input v-model="serverForm.docker_command" required /></label>
-          <label>Default socat image<input v-model="serverForm.default_socat_image" placeholder="alpine/socat:latest" /></label>
+          <label>Docker command<InputText v-model="serverForm.docker_command" required /></label>
+          <label>Default socat image<InputText v-model="serverForm.default_socat_image" placeholder="alpine/socat:latest" /></label>
           <div class="toolbar">
-            <button class="primary" type="submit">{{ editingServerName ? 'Update' : 'Save' }}</button>
-            <button type="button" @click="clearServerForm">{{ editingServerName ? 'Cancel' : 'Clear' }}</button>
+            <Button :label="editingServerName ? 'Update' : 'Save'" icon="pi pi-save" type="submit" />
+            <Button :label="editingServerName ? 'Cancel' : 'Clear'" severity="secondary" outlined type="button" @click="clearServerForm" />
           </div>
         </form>
         <div class="panel">
           <h3>Servers</h3>
-          <table>
-            <thead><tr><th>Name</th><th>Host</th><th>User</th><th>Docker</th><th>Actions</th></tr></thead>
-            <tbody>
-              <tr v-for="server in servers" :key="server.name">
-                <td>{{ server.name }}</td>
-                <td>{{ server.host }}:{{ server.port }}</td>
-                <td>{{ server.user }}</td>
-                <td>{{ server.docker_command }}</td>
-                <td class="actions">
-                  <button type="button" title="Edit" @click="editServer(server)">Edit</button>
-                  <button type="button" title="Test" @click="testServer(server.name)">Test</button>
-                  <button type="button" title="Delete" @click="deleteServer(server.name)">Delete</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+          <DataTable :value="servers" size="small" stripedRows>
+            <Column field="name" header="Name" />
+            <Column header="Host">
+              <template #body="{ data }">{{ data.host }}:{{ data.port }}</template>
+            </Column>
+            <Column field="user" header="User" />
+            <Column field="docker_command" header="Docker" />
+            <Column header="Actions">
+              <template #body="{ data }">
+                <div class="actions">
+                  <Button icon="pi pi-pencil" label="Edit" size="small" text @click="editServer(data)" />
+                  <Button icon="pi pi-check-circle" label="Test" size="small" text @click="testServer(data.name)" />
+                  <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteServer(data.name)" />
+                </div>
+              </template>
+            </Column>
+          </DataTable>
         </div>
       </section>
 
       <section v-if="activeTab === 'Compose'" class="page">
         <div class="toolbar">
-          <select v-model="selectedServer">
-            <option v-for="server in servers" :key="server.name" :value="server.name">{{ server.name }}</option>
-          </select>
-          <button class="primary" type="button" @click="discoverProjects">Discover</button>
+          <Select v-model="selectedServer" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" />
+          <Button label="Discover" icon="pi pi-search" :loading="loading" @click="discoverProjects" />
         </div>
         <div class="project-grid">
           <article v-for="project in projects" :key="project.project" class="panel">
-            <div class="row-between">
+            <div class="project-card-header">
               <h3>{{ project.project }}</h3>
-              <button type="button" @click="loadServices(project.project)">Services</button>
+              <Button label="Services" icon="pi pi-list" size="small" outlined @click="loadServices(project.project)" />
             </div>
             <p>{{ project.services.join(', ') }}</p>
           </article>
         </div>
-        <table>
-          <thead><tr><th>Service</th><th>Container</th><th>Status</th><th>Ports</th><th>Networks</th><th></th></tr></thead>
-          <tbody>
-            <tr v-for="service in services" :key="service.container">
-              <td>{{ service.service }}</td>
-              <td>{{ service.container }}</td>
-              <td>{{ service.status }}</td>
-              <td>{{ service.ports.join(', ') }}</td>
-              <td>{{ service.networks.join(', ') }}</td>
-              <td><button type="button" @click="pickService(service)">Tunnel</button></td>
-            </tr>
-          </tbody>
-        </table>
+        <DataTable :value="services" size="small" stripedRows>
+          <Column field="service" header="Service" />
+          <Column field="container" header="Container" />
+          <Column field="status" header="Status" />
+          <Column header="Ports"><template #body="{ data }">{{ data.ports.join(', ') }}</template></Column>
+          <Column header="Networks"><template #body="{ data }">{{ data.networks.join(', ') }}</template></Column>
+          <Column header=""><template #body="{ data }"><Button label="Tunnel" icon="pi pi-share-alt" size="small" @click="pickService(data)" /></template></Column>
+        </DataTable>
       </section>
 
       <section v-if="activeTab === 'Tunnels'" class="page split">
@@ -578,67 +618,58 @@ onMounted(bootstrap);
           <h3>Create Tunnel</h3>
           <label>
             Server
-            <select v-model="tunnelForm.server" required @change="onTunnelServerChange">
-              <option value="" disabled>Select server</option>
-              <option v-for="server in servers" :key="server.name" :value="server.name">{{ server.name }}</option>
-            </select>
+            <Select v-model="tunnelForm.server" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" @update:modelValue="onTunnelServerChange" />
           </label>
           <label>
             Project
-            <select v-model="tunnelForm.project" required @change="onTunnelProjectChange">
-              <option value="" disabled>Select project</option>
-              <option v-for="project in tunnelProjectOptions" :key="project.project" :value="project.project">
-                {{ project.project }}
-              </option>
-            </select>
+            <Select v-model="tunnelForm.project" :options="tunnelProjectOptions" optionLabel="project" optionValue="project" placeholder="Select project" @update:modelValue="onTunnelProjectChange" />
           </label>
           <label>
             Service container
-            <select v-model="tunnelForm.service" required @change="onTunnelServiceChange">
-              <option value="" disabled>Select service</option>
-              <option v-for="service in tunnelServiceOptions" :key="service.container" :value="service.service">
-                {{ service.service }} · {{ service.container }}
-              </option>
-            </select>
+            <Select v-model="tunnelForm.service" :options="tunnelServiceOptions" optionLabel="container" optionValue="service" placeholder="Select service" @update:modelValue="onTunnelServiceChange" />
           </label>
           <label>
             Network
-            <select v-if="selectedTunnelService" v-model="tunnelForm.network">
-              <option v-for="network in selectedTunnelService.networks" :key="network" :value="network">{{ network }}</option>
-            </select>
-            <input v-else v-model="tunnelForm.network" placeholder="myapp_default" />
+            <Select v-if="selectedTunnelService" v-model="tunnelForm.network" :options="selectedTunnelService.networks" placeholder="Select network" />
+            <InputText v-else v-model="tunnelForm.network" placeholder="myapp_default" />
           </label>
-          <label>Target port<input v-model.number="tunnelForm.target_port" type="number" min="1" required /></label>
-          <label>Local port<input v-model="tunnelForm.local_port" placeholder="auto assign" /></label>
-          <label>Env prefix<input v-model="tunnelForm.env_prefix" placeholder="DATABASE" /></label>
-          <label>socat image<input v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
-          <button class="primary" type="submit">Start</button>
+          <label>Target port<InputNumber v-model="tunnelForm.target_port" :min="1" :useGrouping="false" fluid /></label>
+          <label>Local port<InputText v-model="tunnelForm.local_port" placeholder="auto assign" /></label>
+          <label>Env prefix<InputText v-model="tunnelForm.env_prefix" placeholder="DATABASE" /></label>
+          <label>socat image<InputText v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
+          <Button label="Start" icon="pi pi-play" type="submit" />
         </form>
         <div class="panel">
           <h3>Tunnels</h3>
-          <table>
-            <thead><tr><th>ID</th><th>Remote</th><th>Local</th><th>Status</th><th></th></tr></thead>
-            <tbody>
-              <tr v-for="tunnel in tunnels" :key="tunnel.id">
-                <td>{{ tunnel.id }}</td>
-                <td>{{ tunnel.server }} / {{ tunnel.project }} / {{ tunnel.service }}:{{ tunnel.target_port }}</td>
-                <td>{{ tunnel.local_host }}:{{ tunnel.local_port }}</td>
-                <td><span :class="statusClass(tunnel.status)">{{ tunnel.status }}</span></td>
-                <td><button type="button" @click="closeTunnel(tunnel.id)">Stop</button></td>
-              </tr>
-            </tbody>
-          </table>
+          <DataTable :value="tunnels" size="small" stripedRows>
+            <Column field="id" header="ID" />
+            <Column header="Remote"><template #body="{ data }">{{ data.server }} / {{ data.project }} / {{ data.service }}:{{ data.target_port }}</template></Column>
+            <Column header="Local"><template #body="{ data }">{{ data.local_host }}:{{ data.local_port }}</template></Column>
+            <Column header="Status"><template #body="{ data }"><Tag :value="data.status" :severity="statusSeverity(data.status)" /></template></Column>
+            <Column header="">
+              <template #body="{ data }">
+                <Button
+                  v-if="data.status === 'running'"
+                  label="Stop"
+                  icon="pi pi-stop"
+                  size="small"
+                  severity="danger"
+                  outlined
+                  @click="closeTunnel(data.id)"
+                />
+                <Button v-else label="Start" icon="pi pi-play" size="small" severity="success" outlined @click="startTunnel(data)" />
+              </template>
+            </Column>
+          </DataTable>
         </div>
       </section>
 
       <section v-if="activeTab === 'Env'" class="page">
         <div class="toolbar">
-          <select v-model="selectedTunnel">
-            <option v-for="tunnel in tunnels" :key="tunnel.id" :value="tunnel.id">{{ tunnel.id }}</option>
-          </select>
-          <button type="button" @click="renderEnv">Preview</button>
-          <input v-model="envPath" />
-          <button class="primary" type="button" @click="writeEnv">Write</button>
+          <Select v-model="selectedTunnel" :options="tunnelOptions" optionLabel="label" optionValue="value" placeholder="Select tunnel" />
+          <Button label="Preview" icon="pi pi-eye" outlined @click="renderEnv" />
+          <InputText v-model="envPath" />
+          <Button label="Write" icon="pi pi-file-export" @click="writeEnv" />
         </div>
         <pre>{{ envPreview }}</pre>
       </section>
@@ -648,13 +679,14 @@ onMounted(bootstrap);
       </section>
 
       <section v-if="activeTab === 'Settings'" class="page form settings">
-        <label>Default local host<input v-model="defaults.local_host" /></label>
-        <label>Default socat image<input v-model="defaults.socat_image" /></label>
-        <label>socat command<input v-model="defaults.socat_command" /></label>
-        <label>SSH binary<input v-model="defaults.ssh_binary" /></label>
-        <label>Docker timeout seconds<input v-model.number="defaults.docker_timeout_secs" type="number" min="1" /></label>
-        <button class="primary" type="button" @click="saveDefaultSettings">Save Settings</button>
+        <label>Default local host<InputText v-model="defaults.local_host" /></label>
+        <label>Default socat image<InputText v-model="defaults.socat_image" /></label>
+        <label>socat command<InputText v-model="defaults.socat_command" /></label>
+        <label>SSH binary<InputText v-model="defaults.ssh_binary" /></label>
+        <label>Docker timeout seconds<InputNumber v-model="defaults.docker_timeout_secs" :min="1" :useGrouping="false" fluid /></label>
+        <Button label="Save Settings" icon="pi pi-save" @click="saveDefaultSettings" />
       </section>
-    </section>
+      </section>
+    </ScrollPanel>
   </main>
 </template>
