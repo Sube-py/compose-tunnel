@@ -9,14 +9,12 @@ use compose_tunnel_core::{
     list_compose_services as core_list_compose_services,
     list_env_profiles as core_list_env_profiles, list_servers as core_list_servers,
     list_tunnels as core_list_tunnels, load_config, open_tunnel as core_open_tunnel,
-    preview_cleanup as core_preview_cleanup, render_env as core_render_env,
-    render_env_profile as core_render_env_profile, save_defaults as core_save_defaults,
-    save_env_profile as core_save_env_profile, save_server as core_save_server,
-    set_active_env_profile as core_set_active_env_profile, test_server as core_test_server,
-    write_env_file as core_write_env_file, write_env_profile as core_write_env_profile, AppConfig,
+    preview_cleanup as core_preview_cleanup, render_env_profile as core_render_env_profile,
+    save_defaults as core_save_defaults, save_env_profile as core_save_env_profile,
+    save_server as core_save_server, set_active_env_profile as core_set_active_env_profile,
+    test_server as core_test_server, write_env_profile as core_write_env_profile, AppConfig,
     AppError, AppPaths, CleanupResult, ComposeProject, ComposeService, Defaults, EnvProfileConfig,
-    OpenTunnelRequest, ServerConfig, ServerTestResult, TunnelState, WriteEnvFileRequest,
-    WriteEnvProfileRequest,
+    OpenTunnelRequest, ServerConfig, ServerTestResult, TunnelState, WriteEnvProfileRequest,
 };
 
 type CommandResult<T> = std::result::Result<T, String>;
@@ -125,16 +123,6 @@ pub async fn close_all_tunnels() -> CommandResult<()> {
 #[tauri::command]
 pub async fn list_tunnels() -> CommandResult<Vec<TunnelState>> {
     core_list_tunnels().await.map_err(map_error)
-}
-
-#[tauri::command]
-pub async fn render_env(tunnel_id: String) -> CommandResult<String> {
-    core_render_env(tunnel_id).await.map_err(map_error)
-}
-
-#[tauri::command]
-pub async fn write_env_file(request: WriteEnvFileRequest) -> CommandResult<()> {
-    core_write_env_file(request).await.map_err(map_error)
 }
 
 #[tauri::command]

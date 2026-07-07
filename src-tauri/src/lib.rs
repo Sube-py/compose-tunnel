@@ -25,8 +25,6 @@ pub fn run() {
             commands::close_tunnel,
             commands::close_all_tunnels,
             commands::list_tunnels,
-            commands::render_env,
-            commands::write_env_file,
             commands::render_env_profile,
             commands::write_env_profile,
             commands::cleanup,

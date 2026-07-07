@@ -144,8 +144,6 @@ pub struct ProfileConfig {
     pub network: Option<String>,
     pub target_port: u16,
     #[serde(default)]
-    pub env_prefix: Option<String>,
-    #[serde(default)]
     pub env: Vec<EnvEntry>,
 }
 
@@ -223,8 +221,6 @@ pub struct TunnelState {
     #[serde(default)]
     pub mode: TunnelMode,
     #[serde(default)]
-    pub env_prefix: Option<String>,
-    #[serde(default)]
     pub started_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -258,14 +254,6 @@ pub struct OpenTunnelRequest {
     pub socat_port: Option<u16>,
     #[serde(default)]
     pub socat_image: Option<String>,
-    #[serde(default)]
-    pub env_prefix: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteEnvFileRequest {
-    pub tunnel_id: String,
-    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -730,10 +718,6 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         &request.service,
         request.target_port,
     );
-    let env_prefix = request
-        .env_prefix
-        .clone()
-        .or_else(|| Some(default_env_prefix(&request.service)));
     let existing_state = load_state().await?;
     let tunnel_id = tunnel_state_id(
         &existing_state,
@@ -795,7 +779,6 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         ssh_pid,
         status: TunnelStatus::Running,
         mode: TunnelMode::SocatDirect,
-        env_prefix,
         started_at: Some(now_string()),
         last_error: None,
     };
@@ -907,21 +890,6 @@ fn cleanup_candidates(containers: Vec<String>, state: &AppState, server_id: &str
         .into_iter()
         .filter(|container| !active.contains(container.as_str()))
         .collect()
-}
-
-pub async fn render_env(tunnel_id: String) -> Result<String> {
-    let state = load_state().await?;
-    let tunnel = state
-        .tunnels
-        .iter()
-        .find(|item| item.id == tunnel_id)
-        .ok_or_else(|| AppError::msg(format!("tunnel {tunnel_id} was not found")))?;
-    Ok(env_for_tunnel(tunnel))
-}
-
-pub async fn write_env_file(request: WriteEnvFileRequest) -> Result<()> {
-    let env = render_env(request.tunnel_id.clone()).await?;
-    write_managed_block(&request.path, &request.tunnel_id, &env).await
 }
 
 pub async fn render_env_profile(name: String) -> Result<String> {
@@ -1296,19 +1264,6 @@ fn sanitize_name(value: &str) -> String {
         .collect()
 }
 
-fn default_env_prefix(service: &str) -> String {
-    service
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn normalize_env_name(value: &str) -> String {
     let mut output: String = value
         .trim()
@@ -1330,17 +1285,6 @@ fn normalize_env_name(value: &str) -> String {
         output.insert(0, '_');
     }
     output
-}
-
-fn env_for_tunnel(tunnel: &TunnelState) -> String {
-    let prefix = tunnel
-        .env_prefix
-        .clone()
-        .unwrap_or_else(|| default_env_prefix(&tunnel.service));
-    format!(
-        "{prefix}_HOST={}\n{prefix}_PORT={}\n",
-        tunnel.local_host, tunnel.local_port
-    )
 }
 
 fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Result<String> {
@@ -1409,24 +1353,6 @@ fn resolve_env_profile_value(value: &str, port_values: &BTreeMap<String, String>
 
     resolved.push_str(&value[cursor..]);
     resolved
-}
-
-async fn write_managed_block(path: &Path, tunnel_id: &str, env: &str) -> Result<()> {
-    let start = format!("# compose-tunnel:start {tunnel_id}");
-    let end = format!("# compose-tunnel:end {tunnel_id}");
-    let block = format!("{start}\n{}{end}\n", env.trim_end());
-    let existing = match fs::read_to_string(path).await {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-
-    let updated = replace_block(&existing, &start, &end, &block);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    fs::write(path, updated).await?;
-    Ok(())
 }
 
 async fn write_env_profile_block(path: &Path, env: &str) -> Result<()> {
@@ -1704,12 +1630,6 @@ mod tests {
             .concat()
         );
     }
-
-    #[test]
-    fn env_prefix_is_upper_snake() {
-        assert_eq!(default_env_prefix("my-db"), "MY_DB");
-    }
-
     #[test]
     fn env_names_are_normalized_for_dotenv_output() {
         assert_eq!(normalize_env_name("server-db"), "server_db");
@@ -1745,7 +1665,6 @@ mod tests {
                     ssh_pid: Some(1234),
                     status: TunnelStatus::Running,
                     mode: TunnelMode::SocatDirect,
-                    env_prefix: None,
                     started_at: None,
                     last_error: None,
                 },
@@ -1764,7 +1683,6 @@ mod tests {
                     ssh_pid: None,
                     status: TunnelStatus::Stopped,
                     mode: TunnelMode::SocatDirect,
-                    env_prefix: None,
                     started_at: None,
                     last_error: None,
                 },
@@ -1805,7 +1723,6 @@ mod tests {
                 ssh_pid: Some(1234),
                 status: TunnelStatus::Running,
                 mode: TunnelMode::SocatDirect,
-                env_prefix: None,
                 started_at: None,
                 last_error: None,
             }],
@@ -1840,7 +1757,6 @@ mod tests {
                 ssh_pid: Some(1234),
                 status: TunnelStatus::Running,
                 mode: TunnelMode::SocatDirect,
-                env_prefix: None,
                 started_at: None,
                 last_error: None,
             }],
@@ -1872,7 +1788,6 @@ mod tests {
                 ssh_pid: None,
                 status: TunnelStatus::Running,
                 mode: TunnelMode::SocatDirect,
-                env_prefix: None,
                 started_at: None,
                 last_error: None,
             }],
@@ -1906,7 +1821,6 @@ mod tests {
                 ssh_pid: Some(1234),
                 status: TunnelStatus::Running,
                 mode: TunnelMode::SocatDirect,
-                env_prefix: None,
                 started_at: None,
                 last_error: None,
             }],
@@ -1967,7 +1881,6 @@ mod tests {
                 ssh_pid: None,
                 status: TunnelStatus::Running,
                 mode: TunnelMode::SocatDirect,
-                env_prefix: None,
                 started_at: None,
                 last_error: None,
             }],
@@ -2021,7 +1934,6 @@ mod tests {
                 ssh_pid: None,
                 status: TunnelStatus::Running,
                 mode: TunnelMode::SocatDirect,
-                env_prefix: None,
                 started_at: None,
                 last_error: None,
             }],

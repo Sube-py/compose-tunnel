@@ -7,10 +7,9 @@ use clap::{Args, Parser, Subcommand};
 use compose_tunnel_core::{
     active_env_profiles, cleanup, close_all_tunnels, close_tunnel, delete_env_profile,
     delete_server, init_config, list_compose_projects, list_compose_services, list_env_profiles,
-    list_servers, list_tunnels, open_tunnel, preview_cleanup, render_env, render_env_profile,
-    save_env_profile, save_server, set_active_env_profile, test_server, write_env_file,
-    write_env_profile, EnvPlainEntry, EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest,
-    ServerConfig, WriteEnvFileRequest, WriteEnvProfileRequest,
+    list_servers, list_tunnels, open_tunnel, preview_cleanup, render_env_profile, save_env_profile,
+    save_server, set_active_env_profile, test_server, write_env_profile, EnvPlainEntry,
+    EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest, ServerConfig, WriteEnvProfileRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -107,8 +106,6 @@ struct OpenArgs {
     socat_port: Option<u16>,
     #[arg(long)]
     socat_image: Option<String>,
-    #[arg(long)]
-    env_prefix: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -133,10 +130,7 @@ struct CleanupArgs {
 #[derive(Debug, Args)]
 struct EnvArgs {
     #[command(subcommand)]
-    command: Option<EnvCommand>,
-    tunnel_id: Option<String>,
-    #[arg(long)]
-    write: Option<PathBuf>,
+    command: EnvCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -208,7 +202,6 @@ async fn main() -> anyhow::Result<()> {
                 local_host: args.local_host,
                 socat_port: args.socat_port,
                 socat_image: args.socat_image,
-                env_prefix: args.env_prefix,
             })
             .await?;
             println!("Tunnel started\n");
@@ -225,7 +218,6 @@ async fn main() -> anyhow::Result<()> {
                 tunnel.socat_container_ip, tunnel.socat_port
             );
             println!("Mode:             socat-direct");
-            println!("Env:\n{}", render_env(tunnel.id).await?.trim_end());
         }
         Command::Close(args) => {
             if args.all {
@@ -309,24 +301,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn handle_env(args: EnvArgs) -> anyhow::Result<()> {
     match args.command {
-        Some(EnvCommand::Profile { command }) => handle_env_profile(command).await,
-        None => {
-            let Some(tunnel_id) = args.tunnel_id else {
-                anyhow::bail!("pass a tunnel id or an env subcommand");
-            };
-            let env = render_env(tunnel_id.clone()).await?;
-            if let Some(path) = args.write {
-                write_env_file(WriteEnvFileRequest {
-                    tunnel_id,
-                    path: path.clone(),
-                })
-                .await?;
-                println!("Wrote compose-tunnel env block to {}", path.display());
-            } else {
-                print!("{env}");
-            }
-            Ok(())
-        }
+        EnvCommand::Profile { command } => handle_env_profile(command).await,
     }
 }
 
@@ -738,9 +713,9 @@ mod tests {
 
         match cli.command {
             Command::Env(args) => match args.command {
-                Some(EnvCommand::Profile {
+                EnvCommand::Profile {
                     command: EnvProfileCommand::Write(write_args),
-                }) => {
+                } => {
                     assert_eq!(write_args.name, "staging-db");
                     assert!(write_args.yes);
                 }
@@ -764,9 +739,9 @@ mod tests {
 
         match cli.command {
             Command::Env(args) => match args.command {
-                Some(EnvCommand::Profile {
+                EnvCommand::Profile {
                     command: EnvProfileCommand::Delete(delete_args),
-                }) => {
+                } => {
                     assert_eq!(delete_args.name, "staging-db");
                     assert!(delete_args.yes);
                 }

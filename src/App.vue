@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useConfirm } from "primevue/useconfirm";
 import { useToast } from "primevue/usetoast";
 import Button from "primevue/button";
@@ -67,7 +67,6 @@ type TunnelState = {
   ssh_pid?: number | null;
   status: "running" | "stopped" | "error";
   mode: "socat-direct";
-  env_prefix?: string | null;
   started_at?: string | null;
   last_error?: string | null;
 };
@@ -155,7 +154,6 @@ const tunnelForm = reactive({
   target_port: 5432,
   network: "",
   local_port: "",
-  env_prefix: "DATABASE",
   socat_image: "",
 });
 
@@ -447,7 +445,6 @@ async function openTunnel() {
         local_host: defaults.local_host,
         socat_port: null,
         socat_image: optional(tunnelForm.socat_image),
-        env_prefix: optional(tunnelForm.env_prefix),
       },
     });
     tunnelForm.local_port = "";
@@ -618,63 +615,8 @@ async function openTunnelFromState(tunnel: TunnelState, localPort: number | null
       local_host: tunnel.local_host || defaults.local_host,
       socat_port: tunnel.socat_port,
       socat_image: null,
-      env_prefix: tunnel.env_prefix,
     },
   });
-}
-
-async function copyTunnelEnv(tunnel: TunnelState) {
-  const env = await runTask(
-    `Copied env for ${tunnel.id}`,
-    async () => {
-      const output = await invoke<string>("render_env", { tunnelId: tunnel.id });
-      await copyText(output.trimEnd());
-      return output;
-    },
-    false,
-  );
-  if (env !== null) {
-    toast.add({ severity: "success", summary: "Env copied", detail: tunnel.id, life: 2400 });
-  }
-}
-
-async function writeTunnelEnv(tunnel: TunnelState) {
-  const path = await save({
-    defaultPath: ".env.local",
-    filters: [{ name: "Env files", extensions: ["env", "local"] }],
-  });
-  if (!path) {
-    return;
-  }
-  await runTask(`Wrote env for ${tunnel.id}`, async () => {
-    await invoke("write_env_file", {
-      request: {
-        tunnel_id: tunnel.id,
-        path,
-      },
-    });
-    logs.value.unshift(`${new Date().toLocaleTimeString()} Wrote env for ${tunnel.id} to ${path}`);
-    toast.add({ severity: "info", summary: "Updated env file", detail: path, life: 4200 });
-  }, false);
-}
-
-async function copyText(value: string) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
-  }
-  const textarea = document.createElement("textarea");
-  textarea.value = value;
-  textarea.style.position = "fixed";
-  textarea.style.left = "-9999px";
-  document.body.appendChild(textarea);
-  textarea.focus();
-  textarea.select();
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  if (!copied) {
-    throw new Error("clipboard copy failed");
-  }
 }
 
 async function saveDefaultSettings() {
@@ -1267,8 +1209,6 @@ onMounted(bootstrap);
             <Column header="">
               <template #body="{ data }">
                 <div class="actions">
-                  <Button icon="pi pi-copy" label="Copy env" size="small" text @click="copyTunnelEnv(data)" />
-                  <Button icon="pi pi-file-export" label="Write env" size="small" text @click="writeTunnelEnv(data)" />
                   <Button
                     v-if="data.status === 'running'"
                     icon="pi pi-refresh"
@@ -1315,7 +1255,6 @@ onMounted(bootstrap);
               </label>
               <label>Target port<InputNumber v-model="tunnelForm.target_port" :min="1" :useGrouping="false" fluid /></label>
               <label>Local port<InputText v-model="tunnelForm.local_port" placeholder="auto assign" /></label>
-              <label>Env prefix<InputText v-model="tunnelForm.env_prefix" placeholder="DATABASE" /></label>
               <label>socat image<InputText v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
             </div>
             <div class="dialog-actions">
