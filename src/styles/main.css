@@ -315,7 +315,22 @@ nav {
   width: min(100%, 220px);
 }
 
+.env-select.p-select {
+  min-height: 32px;
+}
+
+.env-select .p-select-label {
+  padding-block: 5px;
+  line-height: 20px;
+}
+
+.env-select .p-select-dropdown {
+  width: 32px;
+}
+
 .env-table .p-datatable-tbody > tr > td {
+  padding-top: 8px;
+  padding-bottom: 8px;
   vertical-align: top;
 }
 
@@ -328,8 +343,8 @@ nav {
 }
 
 .env-table .actions {
-  min-width: 430px;
-  align-items: flex-start;
+  min-width: 250px;
+  align-items: center;
 }
 
 .env-dialog .p-datatable-table {

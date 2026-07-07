@@ -840,22 +840,21 @@ async function activateEnvProfileName(name: string | null) {
   }
   await runTask(`Activated env ${name}`, async () => {
     await invoke("set_active_env_profile", { name });
+    const path = await invoke<string>("write_env_profile", {
+      request: { name },
+    });
     await refreshEnvProfiles();
-  });
+    envPreview.value = await invoke<string>("render_env_profile", { name });
+    toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
+  }, false);
 }
 
 async function chooseEnvProject() {
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected === "string") {
     selectedEnvTargetDir.value = selected;
-    newEnvProfile();
-    toast.add({ severity: "success", summary: `Selected project ${projectFolderName(selected)}`, life: 2600 });
+    openNewEnvDialog();
   }
-}
-
-function openNewEnvDialogForProject(project: EnvProjectRow) {
-  selectedEnvTargetDir.value = project.target_dir;
-  openNewEnvDialog();
 }
 
 function profilesForProject(project: EnvProjectRow) {
@@ -892,15 +891,6 @@ async function previewActiveEnv(project: EnvProjectRow) {
     return;
   }
   await renderEnvProfilePreview(profile);
-}
-
-async function writeActiveEnvForProject(project: EnvProjectRow) {
-  const profile = activeProfileForProject(project);
-  if (!profile) {
-    toast.add({ severity: "warn", summary: "Select an active env first", life: 3000 });
-    return;
-  }
-  await writeActiveEnvProfile(profile);
 }
 
 async function deleteActiveEnvForProject(project: EnvProjectRow) {
@@ -1366,10 +1356,8 @@ onMounted(bootstrap);
             <Column header="Actions">
               <template #body="{ data }">
                 <div class="actions">
-                  <Button icon="pi pi-plus" label="Add Env" size="small" text @click="openNewEnvDialogForProject(data)" />
                   <Button icon="pi pi-pencil" label="Edit" size="small" text @click="openEditActiveEnv(data)" />
                   <Button icon="pi pi-eye" label="Preview" size="small" text @click="previewActiveEnv(data)" />
-                  <Button icon="pi pi-file-export" label="Write .env" size="small" text @click="writeActiveEnvForProject(data)" />
                   <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteActiveEnvForProject(data)" />
                 </div>
               </template>
