@@ -38,7 +38,7 @@ cargo run -p compose-tunnel-cli -- env profile show staging-db
 cargo run -p compose-tunnel-cli -- env profile use staging-db
 cargo run -p compose-tunnel-cli -- env profile write staging-db
 cargo run -p compose-tunnel-cli -- env profile write staging-db --yes
-cargo run -p compose-tunnel-cli -- env profile delete staging-db
+cargo run -p compose-tunnel-cli -- env profile delete staging-db --yes
 cargo run -p compose-tunnel-cli -- close db
 cargo run -p compose-tunnel-cli -- close --all --yes
 cargo run -p compose-tunnel-cli -- cleanup --server staging --dry-run

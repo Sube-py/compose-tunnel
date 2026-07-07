@@ -154,7 +154,7 @@ enum EnvProfileCommand {
     Show { name: String },
     Use { name: String },
     Write(EnvProfileWriteArgs),
-    Delete { name: String },
+    Delete(EnvProfileDeleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -170,6 +170,13 @@ struct EnvProfileSaveArgs {
 
 #[derive(Debug, Args)]
 struct EnvProfileWriteArgs {
+    name: String,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct EnvProfileDeleteArgs {
     name: String,
     #[arg(long)]
     yes: bool,
@@ -391,9 +398,18 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
             .await?;
             println!("Wrote env profile {} to {}", args.name, path.display());
         }
-        EnvProfileCommand::Delete { name } => {
-            delete_env_profile(name.clone()).await?;
-            println!("Deleted env profile {name}");
+        EnvProfileCommand::Delete(args) => {
+            if !args.yes
+                && !confirm_dangerous_action(
+                    "env profile delete requires --yes when stdin is not interactive",
+                    "Delete this env profile config? [y/N] ",
+                )?
+            {
+                println!("Env profile delete cancelled");
+                return Ok(());
+            }
+            delete_env_profile(args.name.clone()).await?;
+            println!("Deleted env profile {}", args.name);
         }
     }
     Ok(())
@@ -729,6 +745,32 @@ mod tests {
                     assert!(write_args.yes);
                 }
                 _ => panic!("expected env profile write command"),
+            },
+            _ => panic!("expected env command"),
+        }
+    }
+
+    #[test]
+    fn parses_env_profile_delete_yes() {
+        let cli = Cli::try_parse_from([
+            "compose-tunnel",
+            "env",
+            "profile",
+            "delete",
+            "staging-db",
+            "--yes",
+        ])
+        .expect("env profile delete yes should parse");
+
+        match cli.command {
+            Command::Env(args) => match args.command {
+                Some(EnvCommand::Profile {
+                    command: EnvProfileCommand::Delete(delete_args),
+                }) => {
+                    assert_eq!(delete_args.name, "staging-db");
+                    assert!(delete_args.yes);
+                }
+                _ => panic!("expected env profile delete command"),
             },
             _ => panic!("expected env command"),
         }
