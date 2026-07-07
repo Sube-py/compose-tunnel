@@ -195,6 +195,10 @@ nav {
   flex-wrap: wrap;
 }
 
+.actions {
+  flex-wrap: wrap;
+}
+
 .toolbar .p-select,
 .toolbar .p-inputtext {
   max-width: 260px;
@@ -276,6 +280,32 @@ nav {
 .breakable {
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.env-table .p-datatable-tbody > tr > td {
+  vertical-align: top;
+}
+
+.env-project-group {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  color: #28423b;
+  font-weight: 700;
+}
+
+.env-project-group span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.empty-state {
+  padding: 18px;
+  color: #687873;
+  text-align: center;
 }
 
 .env-dialog {

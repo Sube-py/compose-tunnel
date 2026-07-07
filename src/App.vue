@@ -195,6 +195,16 @@ const envBindingTunnelOptions = computed(() =>
       value: tunnel.id,
     })),
 );
+const envProfileRows = computed(() =>
+  [...envProfiles.value].sort((left, right) => {
+    const leftTarget = envTargetKey(left);
+    const rightTarget = envTargetKey(right);
+    if (leftTarget !== rightTarget) {
+      return leftTarget.localeCompare(rightTarget);
+    }
+    return left.name.localeCompare(right.name);
+  }),
+);
 const tunnelProjectOptions = computed(() =>
   projects.value.filter((project) => project.server === tunnelForm.server),
 );
@@ -781,6 +791,10 @@ function envTargetKey(profile: EnvProfileConfig) {
   return profile.target_dir?.trim() ?? "";
 }
 
+function envProjectLabel(profile: EnvProfileConfig) {
+  return envTargetKey(profile) || "Project directory not set";
+}
+
 function isActiveEnvProfile(profile: EnvProfileConfig) {
   const key = envTargetKey(profile);
   return Boolean(key) && activeEnvProfiles.value[key] === profile.name;
@@ -1049,9 +1063,27 @@ onMounted(bootstrap);
             <h3>Env Profiles</h3>
             <Button label="Add Env" icon="pi pi-plus" @click="openNewEnvDialog" />
           </div>
-          <DataTable :value="envProfiles" size="small" stripedRows>
+          <DataTable
+            :value="envProfileRows"
+            size="small"
+            stripedRows
+            rowGroupMode="subheader"
+            groupRowsBy="target_dir"
+            sortField="target_dir"
+            :sortOrder="1"
+            class="env-table"
+          >
+            <template #groupheader="{ data }">
+              <div class="env-project-group">
+                <i class="pi pi-folder"></i>
+                <span>{{ envProjectLabel(data) }}</span>
+              </div>
+            </template>
+            <template #empty>
+              <div class="empty-state">No env profiles yet.</div>
+            </template>
             <Column field="name" header="Name" />
-            <Column header="Target directory">
+            <Column header="Project directory">
               <template #body="{ data }">
                 <span class="breakable">{{ data.target_dir || "not set" }}</span>
               </template>
@@ -1072,7 +1104,15 @@ onMounted(bootstrap);
               <template #body="{ data }">
                 <div class="actions">
                   <Button icon="pi pi-pencil" label="Edit" size="small" text @click="openEditEnvDialog(data)" />
-                  <Button icon="pi pi-check-circle" label="Use Env" size="small" severity="success" text @click="activateEnvProfile(data)" />
+                  <Button
+                    icon="pi pi-check-circle"
+                    :label="isActiveEnvProfile(data) ? 'Using' : 'Use Env'"
+                    size="small"
+                    severity="success"
+                    text
+                    :disabled="isActiveEnvProfile(data)"
+                    @click="activateEnvProfile(data)"
+                  />
                   <Button icon="pi pi-eye" label="Preview" size="small" text @click="renderEnvProfilePreview(data)" />
                   <Button icon="pi pi-file-export" label="Write .env" size="small" text @click="writeActiveEnvProfile(data)" />
                   <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteEnvProfile(data)" />
@@ -1095,7 +1135,7 @@ onMounted(bootstrap);
             <div class="env-profile-grid">
               <label>Env name<InputText v-model="envProfileForm.name" placeholder="test" /></label>
               <label>
-                Target directory
+                Project directory
                 <div class="inline-field">
                   <InputText v-model="envProfileForm.target_dir" placeholder="/path/to/app" />
                   <Button label="Choose" icon="pi pi-folder-open" outlined @click="chooseEnvDirectory" />
