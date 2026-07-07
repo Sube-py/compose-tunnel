@@ -2,9 +2,11 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use compose_tunnel_core::{
-    cleanup, close_all_tunnels, close_tunnel, delete_server, init_config, list_compose_projects,
-    list_compose_services, list_servers, list_tunnels, open_tunnel, render_env, save_server,
-    test_server, write_env_file, OpenTunnelRequest, ServerConfig, WriteEnvFileRequest,
+    active_env_profiles, cleanup, close_all_tunnels, close_tunnel, delete_server, init_config,
+    list_compose_projects, list_compose_services, list_env_profiles, list_servers, list_tunnels,
+    open_tunnel, render_env, render_env_profile, save_server, set_active_env_profile, test_server,
+    write_env_file, write_env_profile, OpenTunnelRequest, ServerConfig, WriteEnvFileRequest,
+    WriteEnvProfileRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -110,9 +112,27 @@ struct CloseArgs {
 
 #[derive(Debug, Args)]
 struct EnvArgs {
-    tunnel_id: String,
+    #[command(subcommand)]
+    command: Option<EnvCommand>,
+    tunnel_id: Option<String>,
     #[arg(long)]
     write: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum EnvCommand {
+    Profile {
+        #[command(subcommand)]
+        command: EnvProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnvProfileCommand {
+    List,
+    Show { name: String },
+    Use { name: String },
+    Write { name: String },
 }
 
 #[tokio::main]
@@ -197,11 +217,23 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Command::Env(args) => {
-            let env = render_env(args.tunnel_id.clone()).await?;
+        Command::Env(args) => handle_env(args).await?,
+    }
+
+    Ok(())
+}
+
+async fn handle_env(args: EnvArgs) -> anyhow::Result<()> {
+    match args.command {
+        Some(EnvCommand::Profile { command }) => handle_env_profile(command).await,
+        None => {
+            let Some(tunnel_id) = args.tunnel_id else {
+                anyhow::bail!("pass a tunnel id or an env subcommand");
+            };
+            let env = render_env(tunnel_id.clone()).await?;
             if let Some(path) = args.write {
                 write_env_file(WriteEnvFileRequest {
-                    tunnel_id: args.tunnel_id,
+                    tunnel_id,
                     path: path.clone(),
                 })
                 .await?;
@@ -209,9 +241,50 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 print!("{env}");
             }
+            Ok(())
         }
     }
+}
 
+async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
+    match command {
+        EnvProfileCommand::List => {
+            let active = active_env_profiles().await?;
+            println!("NAME\tTARGET DIR\tACTIVE\tTUNNEL PORTS\tEXTRA ENV");
+            for profile in list_env_profiles().await? {
+                let target_dir = profile
+                    .target_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                let active_text = if active.get(&target_dir) == Some(&profile.name) {
+                    "yes"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    profile.name,
+                    target_dir,
+                    active_text,
+                    profile.tunnel_ports.len(),
+                    profile.extra_env.len()
+                );
+            }
+        }
+        EnvProfileCommand::Show { name } => {
+            print!("{}", render_env_profile(name).await?);
+        }
+        EnvProfileCommand::Use { name } => {
+            set_active_env_profile(name.clone()).await?;
+            println!("Activated env profile {name}");
+        }
+        EnvProfileCommand::Write { name } => {
+            set_active_env_profile(name.clone()).await?;
+            let path = write_env_profile(WriteEnvProfileRequest { name: name.clone() }).await?;
+            println!("Wrote env profile {name} to {}", path.display());
+        }
+    }
     Ok(())
 }
 
