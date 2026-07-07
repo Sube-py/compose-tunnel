@@ -16,6 +16,7 @@ import ScrollPanel from "primevue/scrollpanel";
 import Select from "primevue/select";
 import Tag from "primevue/tag";
 import Toast from "primevue/toast";
+import logoUrl from "../assets/logo.svg";
 
 type Defaults = {
   local_host: string;
@@ -1025,7 +1026,7 @@ onMounted(bootstrap);
     <ConfirmDialog />
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-mark">CT</span>
+        <img class="brand-mark" :src="logoUrl" alt="" />
         <div>
           <h1>Compose Tunnel</h1>
           <p>SSH to Compose internals</p>

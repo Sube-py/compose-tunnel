@@ -61,14 +61,10 @@ pre {
 }
 
 .brand-mark {
-  display: grid;
   width: 42px;
   height: 42px;
-  place-items: center;
-  border-radius: 8px;
-  background: #e0b15e;
-  color: #12231f;
-  font-weight: 800;
+  flex: 0 0 42px;
+  border-radius: 10px;
 }
 
 .brand h1,
