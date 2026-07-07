@@ -1,4 +1,8 @@
-# compose-tunnel
+<p align="center">
+  <img src="assets/readme-hero.svg" alt="compose-tunnel: Reach private Compose services. Keep remote ports closed." />
+</p>
+
+# <img src="assets/logo.svg" alt="" width="32" height="32" align="top" /> compose-tunnel
 
 `compose-tunnel` forwards internal Docker Compose services on a remote server to a local port through SSH. It starts a temporary `socat` container inside the target Compose network and forwards local traffic directly to that container IP, without publishing a remote host port.
 
