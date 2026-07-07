@@ -427,7 +427,7 @@ pub async fn active_env_profiles() -> Result<BTreeMap<String, String>> {
 pub async fn save_env_profile(profile: EnvProfileConfig) -> Result<()> {
     validate_name("env profile name", &profile.name)?;
     let mut profile = profile;
-    env_profile_target_key(&profile)?;
+    profile.target_dir = Some(env_profile_target_dir(&profile)?);
     profile.tunnel_ports.retain(|item| {
         !item.tunnel_id.trim().is_empty()
             && !item.alias.trim().is_empty()
@@ -855,10 +855,7 @@ pub async fn write_env_profile(request: WriteEnvProfileRequest) -> Result<PathBu
             request.name, target_key
         )));
     }
-    let target_dir = profile
-        .target_dir
-        .clone()
-        .ok_or_else(|| AppError::msg("target directory is required"))?;
+    let target_dir = env_profile_target_dir(profile)?;
     let env = render_env_profile(request.name.clone()).await?;
     let env_file = target_dir.join(".env");
     write_env_profile_block(&env_file, &env).await?;
@@ -911,15 +908,27 @@ fn active_env_profiles_for_config(config: &AppConfig) -> BTreeMap<String, String
 }
 
 fn env_profile_target_key(profile: &EnvProfileConfig) -> Result<String> {
+    Ok(env_profile_target_dir(profile)?
+        .to_string_lossy()
+        .trim()
+        .to_string())
+}
+
+fn env_profile_target_dir(profile: &EnvProfileConfig) -> Result<PathBuf> {
     let target_dir = profile
         .target_dir
         .as_ref()
         .ok_or_else(|| AppError::msg("target directory is required"))?;
-    let target_key = target_dir.to_string_lossy().trim().to_string();
-    if target_key.is_empty() {
+    let target_dir = target_dir.to_string_lossy().trim().to_string();
+    if target_dir.is_empty() {
         return Err(AppError::msg("target directory is required"));
     }
-    Ok(target_key)
+    let expanded = expand_home(&target_dir);
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Ok(std::env::current_dir()?.join(expanded))
+    }
 }
 
 fn validate_name(label: &str, value: &str) -> Result<()> {
@@ -1527,5 +1536,19 @@ mod tests {
         let error = env_profile_target_key(&profile).expect_err("target dir should be required");
 
         assert_eq!(error.to_string(), "target directory is required");
+    }
+
+    #[test]
+    fn env_profile_target_directory_is_normalized_to_absolute_path() {
+        let profile = EnvProfileConfig {
+            name: "test".to_string(),
+            target_dir: Some(PathBuf::from("relative-app")),
+            ..EnvProfileConfig::default()
+        };
+
+        let target_dir = env_profile_target_dir(&profile).expect("target dir should normalize");
+
+        assert!(target_dir.is_absolute());
+        assert!(target_dir.ends_with("relative-app"));
     }
 }
