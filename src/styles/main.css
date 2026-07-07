@@ -195,6 +195,16 @@ nav {
   flex-wrap: wrap;
 }
 
+.toolbar .p-button,
+.actions .p-button {
+  flex: 0 0 auto;
+}
+
+.toolbar .p-button-label,
+.actions .p-button-label {
+  white-space: nowrap;
+}
+
 .toolbar .p-select,
 .toolbar .p-inputtext {
   max-width: 260px;
@@ -282,6 +292,31 @@ nav {
   vertical-align: top;
 }
 
+.env-table .p-datatable-table {
+  min-width: 820px;
+}
+
+.env-table .p-datatable-wrapper {
+  overflow-x: auto;
+}
+
+.env-table .actions {
+  min-width: 220px;
+  align-items: flex-start;
+}
+
+.env-dialog .p-datatable-table {
+  min-width: 680px;
+}
+
+.env-dialog .p-datatable-wrapper {
+  overflow-x: auto;
+}
+
+.env-dialog .p-button {
+  min-width: max-content;
+}
+
 .env-project-group {
   display: flex;
   min-width: 0;
@@ -324,6 +359,10 @@ nav {
   z-index: 1;
   padding-top: 12px;
   background: #ffffff;
+}
+
+.env-dialog-actions {
+  justify-content: flex-end;
 }
 
 .nested-panel {

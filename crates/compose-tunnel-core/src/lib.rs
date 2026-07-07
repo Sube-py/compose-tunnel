@@ -1345,6 +1345,7 @@ fn env_for_tunnel(tunnel: &TunnelState) -> String {
 
 fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Result<String> {
     let mut lines = vec![format!("# compose-tunnel env: {}", profile.name)];
+    let mut port_values = BTreeMap::new();
 
     for binding in &profile.tunnel_ports {
         let tunnel = state
@@ -1356,11 +1357,13 @@ fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Res
             continue;
         }
         let alias = normalize_env_name(&binding.alias);
-        lines.push(format!("{alias}={}", tunnel.local_port));
+        let port = tunnel.local_port.to_string();
+        port_values.insert(alias.clone(), port.clone());
+        lines.push(format!("{alias}={port}"));
         if let Some(env_key) = binding.env_key.as_ref().map(|value| value.trim()) {
             if !env_key.is_empty() {
                 let env_key = normalize_env_name(env_key);
-                lines.push(format!("{env_key}=${{{alias}}}"));
+                lines.push(format!("{env_key}={port}"));
             }
         }
     }
@@ -1371,11 +1374,41 @@ fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Res
             continue;
         }
         let key = normalize_env_name(key);
-        lines.push(format!("{key}={}", entry.value));
+        let value = resolve_env_profile_value(&entry.value, &port_values);
+        lines.push(format!("{key}={value}"));
     }
 
     lines.push(String::new());
     Ok(lines.join("\n"))
+}
+
+fn resolve_env_profile_value(value: &str, port_values: &BTreeMap<String, String>) -> String {
+    let mut resolved = String::with_capacity(value.len());
+    let mut cursor = 0;
+
+    while let Some(start) = value[cursor..].find("${") {
+        let absolute_start = cursor + start;
+        resolved.push_str(&value[cursor..absolute_start]);
+
+        let token_start = absolute_start + 2;
+        let Some(end) = value[token_start..].find('}') else {
+            resolved.push_str(&value[absolute_start..]);
+            return resolved;
+        };
+
+        let token_end = token_start + end;
+        let token = &value[token_start..token_end];
+        let normalized_token = normalize_env_name(token);
+        if let Some(port) = port_values.get(&normalized_token) {
+            resolved.push_str(port);
+        } else {
+            resolved.push_str(&value[absolute_start..=token_end]);
+        }
+        cursor = token_end + 1;
+    }
+
+    resolved.push_str(&value[cursor..]);
+    resolved
 }
 
 async fn write_managed_block(path: &Path, tunnel_id: &str, env: &str) -> Result<()> {
@@ -1943,8 +1976,63 @@ mod tests {
         let rendered = render_env_profile_inner(&profile, &state).expect("profile should render");
 
         assert!(rendered.contains("server_db=15432"));
-        assert!(rendered.contains("DATABASE_PORT=${server_db}"));
+        assert!(rendered.contains("DATABASE_PORT=15432"));
         assert!(rendered.contains("DATABASE_HOST=127.0.0.1"));
+    }
+
+    #[test]
+    fn env_profile_replaces_port_references_in_extra_env() {
+        let profile = EnvProfileConfig {
+            name: "test".to_string(),
+            target_dir: Some(PathBuf::from("/tmp/app")),
+            tunnel_ports: vec![EnvTunnelPort {
+                tunnel_id: "db".to_string(),
+                alias: "server_name-container_name".to_string(),
+                env_key: None,
+            }],
+            extra_env: vec![
+                EnvPlainEntry {
+                    key: "DATABASE-PORT".to_string(),
+                    value: "${server_name-container_name}".to_string(),
+                },
+                EnvPlainEntry {
+                    key: "DATABASE-URL".to_string(),
+                    value: "postgres://127.0.0.1:${server_name-container_name}/app".to_string(),
+                },
+                EnvPlainEntry {
+                    key: "UNKNOWN-REF".to_string(),
+                    value: "${not_configured}".to_string(),
+                },
+            ],
+        };
+        let state = AppState {
+            tunnels: vec![TunnelState {
+                id: "db".to_string(),
+                server: "staging".to_string(),
+                project: "app".to_string(),
+                service: "db".to_string(),
+                network: "app_default".to_string(),
+                target_port: 5432,
+                socat_port: 5432,
+                local_host: "127.0.0.1".to_string(),
+                local_port: 15432,
+                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+                socat_container_ip: "172.18.0.20".to_string(),
+                ssh_pid: None,
+                status: TunnelStatus::Running,
+                mode: TunnelMode::SocatDirect,
+                env_prefix: None,
+                started_at: None,
+                last_error: None,
+            }],
+        };
+
+        let rendered = render_env_profile_inner(&profile, &state).expect("profile should render");
+
+        assert!(rendered.contains("server_name_container_name=15432"));
+        assert!(rendered.contains("DATABASE_PORT=15432"));
+        assert!(rendered.contains("DATABASE_URL=postgres://127.0.0.1:15432/app"));
+        assert!(rendered.contains("UNKNOWN_REF=${not_configured}"));
     }
 
     #[test]

@@ -810,10 +810,6 @@ function defaultPortAlias(tunnel: TunnelState) {
   return normalizeEnvName(`${tunnel.server}_${tunnel.service}`);
 }
 
-function portReference(alias: string) {
-  return `\${${alias}}`;
-}
-
 function normalizeEnvName(value: string) {
   const normalized = value.trim().replace(/[^A-Za-z0-9_]/g, "_");
   return normalized.replace(/^[0-9]/, "_$&");
@@ -1269,19 +1265,20 @@ onMounted(bootstrap);
             <Column header="Actions">
               <template #body="{ data }">
                 <div class="actions">
-                  <Button icon="pi pi-pencil" label="Edit" size="small" text @click="openEditEnvDialog(data)" />
+                  <Button icon="pi pi-pencil" size="small" text rounded aria-label="Edit env" @click="openEditEnvDialog(data)" />
                   <Button
                     icon="pi pi-check-circle"
-                    :label="isActiveEnvProfile(data) ? 'Using' : 'Use Env'"
                     size="small"
                     severity="success"
                     text
+                    rounded
+                    :aria-label="isActiveEnvProfile(data) ? 'Env already active' : 'Use env'"
                     :disabled="isActiveEnvProfile(data)"
                     @click="activateEnvProfile(data)"
                   />
-                  <Button icon="pi pi-eye" label="Preview" size="small" text @click="renderEnvProfilePreview(data)" />
-                  <Button icon="pi pi-file-export" label="Write .env" size="small" text @click="writeActiveEnvProfile(data)" />
-                  <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteEnvProfile(data)" />
+                  <Button icon="pi pi-eye" size="small" text rounded aria-label="Preview env" @click="renderEnvProfilePreview(data)" />
+                  <Button icon="pi pi-file-export" size="small" text rounded aria-label="Write .env" @click="writeActiveEnvProfile(data)" />
+                  <Button icon="pi pi-trash" size="small" severity="danger" text rounded aria-label="Delete env" @click="deleteEnvProfile(data)" />
                 </div>
               </template>
             </Column>
@@ -1338,7 +1335,7 @@ onMounted(bootstrap);
                 </Column>
                 <Column header="Output">
                   <template #body="{ data }">
-                    <code v-if="data.env_key">{{ data.env_key }}={{ portReference(data.alias) }}</code>
+                    <code v-if="data.env_key">{{ data.env_key }}=&lt;local-port&gt;</code>
                     <code v-else>{{ data.alias }}=&lt;local-port&gt;</code>
                   </template>
                 </Column>
@@ -1354,7 +1351,7 @@ onMounted(bootstrap);
               <h3>Extra Env</h3>
               <div class="env-profile-grid">
                 <label>Key<InputText v-model="extraEnvKey" placeholder="DATABASE_HOST" /></label>
-                <label>Value<InputText v-model="extraEnvValue" placeholder="127.0.0.1" /></label>
+                <label>Value<InputText v-model="extraEnvValue" placeholder="postgres://127.0.0.1:${server_name_container_name}/app" /></label>
               </div>
               <div class="toolbar">
                 <Button label="Add Env" icon="pi pi-plus" outlined @click="addExtraEnv" />
@@ -1370,7 +1367,7 @@ onMounted(bootstrap);
               </DataTable>
             </div>
 
-            <div class="toolbar">
+            <div class="toolbar env-dialog-actions">
               <Button label="Preview" icon="pi pi-eye" outlined @click="renderEnvProfilePreview()" />
               <Button label="Use Env" icon="pi pi-check-circle" severity="success" outlined @click="activateEnvProfile()" />
               <Button label="Write .env" icon="pi pi-file-export" outlined @click="writeActiveEnvProfile()" />
