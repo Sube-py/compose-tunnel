@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { useToast } from "primevue/usetoast";
 import Button from "primevue/button";
 import Card from "primevue/card";
@@ -509,6 +509,26 @@ async function copyTunnelEnv(tunnel: TunnelState) {
   }
 }
 
+async function writeTunnelEnv(tunnel: TunnelState) {
+  const path = await save({
+    defaultPath: ".env.local",
+    filters: [{ name: "Env files", extensions: ["env", "local"] }],
+  });
+  if (!path) {
+    return;
+  }
+  await runTask(`Wrote env for ${tunnel.id}`, async () => {
+    await invoke("write_env_file", {
+      request: {
+        tunnel_id: tunnel.id,
+        path,
+      },
+    });
+    logs.value.unshift(`${new Date().toLocaleTimeString()} Wrote env for ${tunnel.id} to ${path}`);
+    toast.add({ severity: "info", summary: "Updated env file", detail: path, life: 4200 });
+  }, false);
+}
+
 async function copyText(value: string) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value);
@@ -997,6 +1017,7 @@ onMounted(bootstrap);
               <template #body="{ data }">
                 <div class="actions">
                   <Button icon="pi pi-copy" label="Copy env" size="small" text @click="copyTunnelEnv(data)" />
+                  <Button icon="pi pi-file-export" label="Write env" size="small" text @click="writeTunnelEnv(data)" />
                   <Button
                     v-if="data.status === 'running'"
                     icon="pi pi-refresh"
