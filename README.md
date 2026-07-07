@@ -65,6 +65,8 @@ Click **Use Env** to make that profile active for its target directory. Only one
 
 The CLI can create, update, inspect, use, write, and delete the same env profiles with `compose-tunnel env profile save`, `list`, `show`, `use`, `write`, and `delete`.
 
+The desktop app asks for confirmation before writing extra env keys that look sensitive, such as `PASSWORD`, `TOKEN`, `SECRET`, or `PRIVATE_KEY`.
+
 ## Cleanup
 
 `compose-tunnel cleanup --server <name> --dry-run` lists managed `compose-tunnel` containers that are safe to remove. Without `--dry-run`, the CLI removes those containers. The desktop app previews the same cleanup list and asks for confirmation before deleting remote containers.

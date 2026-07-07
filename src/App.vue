@@ -834,6 +834,32 @@ async function writeActiveEnvProfile(profile?: EnvProfileConfig) {
     }
     name = envProfileForm.name.trim();
   }
+  const savedProfile = envProfiles.value.find((item) => item.name === name) ?? profile;
+  const sensitiveKeys = savedProfile ? sensitiveEnvKeys(savedProfile) : [];
+  if (sensitiveKeys.length > 0) {
+    confirm.require({
+      header: "Write sensitive env values",
+      message: `Write ${sensitiveKeys.join(", ")} to this project's .env file?`,
+      icon: "pi pi-exclamation-triangle",
+      rejectProps: {
+        label: "Cancel",
+        severity: "secondary",
+        outlined: true,
+      },
+      acceptProps: {
+        label: "Write .env",
+        severity: "danger",
+      },
+      accept: () => {
+        void runWriteActiveEnvProfile(name);
+      },
+    });
+    return;
+  }
+  await runWriteActiveEnvProfile(name);
+}
+
+async function runWriteActiveEnvProfile(name: string) {
   await runTask(`Wrote ${name} .env`, async () => {
     await invoke("set_active_env_profile", { name });
     const path = await invoke<string>("write_env_profile", {
@@ -843,6 +869,12 @@ async function writeActiveEnvProfile(profile?: EnvProfileConfig) {
     envPreview.value = await invoke<string>("render_env_profile", { name });
     toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
   }, false);
+}
+
+function sensitiveEnvKeys(profile: EnvProfileConfig) {
+  return profile.extra_env
+    .map((entry) => entry.key.trim())
+    .filter((key) => /password|token|secret|private[_-]?key/i.test(key));
 }
 
 function envTargetKey(profile: EnvProfileConfig) {
