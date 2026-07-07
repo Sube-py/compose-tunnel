@@ -826,6 +826,8 @@ pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect();
+    let state = load_state().await?;
+    let containers = cleanup_candidates(containers, &state, &server_id);
 
     if !containers.is_empty() {
         let joined = containers
@@ -845,6 +847,20 @@ pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
 
 fn managed_container_list_command(docker: &str) -> String {
     format!("{docker} ps -a --filter label=compose-tunnel.managed=true --format '{{{{.Names}}}}'")
+}
+
+fn cleanup_candidates(containers: Vec<String>, state: &AppState, server_id: &str) -> Vec<String> {
+    let active: BTreeSet<&str> = state
+        .tunnels
+        .iter()
+        .filter(|tunnel| tunnel.server == server_id && tunnel.status == TunnelStatus::Running)
+        .map(|tunnel| tunnel.socat_container.as_str())
+        .collect();
+
+    containers
+        .into_iter()
+        .filter(|container| !active.contains(container.as_str()))
+        .collect()
 }
 
 pub async fn render_env(tunnel_id: String) -> Result<String> {
@@ -1514,6 +1530,67 @@ mod tests {
         assert!(command.contains("sudo -n docker ps -a"));
         assert!(command.contains("--filter label=compose-tunnel.managed=true"));
         assert!(!command.contains("--filter name="));
+    }
+
+    #[test]
+    fn cleanup_skips_running_tunnel_containers_for_server() {
+        let state = AppState {
+            tunnels: vec![
+                TunnelState {
+                    id: "db".to_string(),
+                    server: "staging".to_string(),
+                    project: "app".to_string(),
+                    service: "db".to_string(),
+                    network: "app_default".to_string(),
+                    target_port: 5432,
+                    socat_port: 5432,
+                    local_host: "127.0.0.1".to_string(),
+                    local_port: 15432,
+                    socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+                    socat_container_ip: "172.18.0.20".to_string(),
+                    ssh_pid: Some(1234),
+                    status: TunnelStatus::Running,
+                    mode: TunnelMode::SocatDirect,
+                    env_prefix: None,
+                    started_at: None,
+                    last_error: None,
+                },
+                TunnelState {
+                    id: "redis".to_string(),
+                    server: "staging".to_string(),
+                    project: "app".to_string(),
+                    service: "redis".to_string(),
+                    network: "app_default".to_string(),
+                    target_port: 6379,
+                    socat_port: 6379,
+                    local_host: "127.0.0.1".to_string(),
+                    local_port: 16379,
+                    socat_container: "compose-tunnel-staging-app-redis-6379".to_string(),
+                    socat_container_ip: "172.18.0.21".to_string(),
+                    ssh_pid: None,
+                    status: TunnelStatus::Stopped,
+                    mode: TunnelMode::SocatDirect,
+                    env_prefix: None,
+                    started_at: None,
+                    last_error: None,
+                },
+            ],
+        };
+        let containers = vec![
+            "compose-tunnel-staging-app-db-5432".to_string(),
+            "compose-tunnel-staging-app-redis-6379".to_string(),
+            "compose-tunnel-orphan".to_string(),
+        ];
+
+        let candidates = cleanup_candidates(containers, &state, "staging");
+
+        assert_eq!(
+            candidates,
+            vec![
+                "compose-tunnel-staging-app-redis-6379".to_string(),
+                "compose-tunnel-orphan".to_string()
+            ]
+        );
     }
 
     #[test]
