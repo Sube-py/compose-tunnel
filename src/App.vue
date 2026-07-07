@@ -134,13 +134,6 @@ const selectedEnvTargetDir = ref("");
 const selectedEnvProfileName = ref("");
 const editingEnvProfileName = ref("");
 const envDialogVisible = ref(false);
-const envBindingServer = ref("");
-const envBindingProject = ref("");
-const envBindingTunnelId = ref("");
-const envBindingAlias = ref("");
-const envBindingEnvKey = ref("");
-const extraEnvKey = ref("");
-const extraEnvValue = ref("");
 
 const serverForm = reactive<ServerConfig>({
   name: "",
@@ -188,22 +181,8 @@ const dockerModeOptions = [
   { label: "custom", value: "custom" },
 ];
 const serverOptions = computed(() => servers.value.map((server) => ({ label: server.name, value: server.name })));
-const envBindingServerOptions = computed(() =>
-  Array.from(new Set(tunnels.value.map((tunnel) => tunnel.server))).map((server) => ({ label: server, value: server })),
-);
-const envBindingProjectOptions = computed(() =>
-  Array.from(
-    new Set(
-      tunnels.value
-        .filter((tunnel) => !envBindingServer.value || tunnel.server === envBindingServer.value)
-        .map((tunnel) => tunnel.project),
-    ),
-  ).map((project) => ({ label: project, value: project })),
-);
-const envBindingTunnelOptions = computed(() =>
+const envTunnelOptions = computed(() =>
   tunnels.value
-    .filter((tunnel) => !envBindingServer.value || tunnel.server === envBindingServer.value)
-    .filter((tunnel) => !envBindingProject.value || tunnel.project === envBindingProject.value)
     .map((tunnel) => ({
       label: `${tunnel.server}/${tunnel.project}/${tunnel.service}:${tunnel.target_port} (${tunnel.status}, ${tunnel.local_host}:${tunnel.local_port})`,
       value: tunnel.id,
@@ -239,6 +218,13 @@ const envProjectRows = computed<EnvProjectRow[]>(() => {
     });
   }
   return Array.from(projects.values()).sort((left, right) => left.label.localeCompare(right.label));
+});
+const envDialogProfileOptions = computed(() => {
+  const target = envProfileForm.target_dir?.trim() || selectedEnvTargetDir.value;
+  return envProfiles.value
+    .filter((profile) => envTargetKey(profile) === target)
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((profile) => ({ label: profile.name, value: profile.name }));
 });
 const tunnelProjectOptions = computed(() =>
   projects.value.filter((project) => project.server === tunnelForm.server),
@@ -687,13 +673,6 @@ function newEnvProfile() {
   selectedEnvProfileName.value = "";
   editingEnvProfileName.value = "";
   envPreview.value = "";
-  envBindingServer.value = "";
-  envBindingProject.value = "";
-  envBindingTunnelId.value = "";
-  envBindingAlias.value = "";
-  envBindingEnvKey.value = "";
-  extraEnvKey.value = "";
-  extraEnvValue.value = "";
   Object.assign(envProfileForm, {
     name: "",
     target_dir: selectedEnvTargetDir.value,
@@ -711,9 +690,29 @@ function openNewEnvDialog() {
   envDialogVisible.value = true;
 }
 
+function newEnvProfileInDialog() {
+  const target = envProfileForm.target_dir?.trim() || selectedEnvTargetDir.value;
+  selectedEnvTargetDir.value = target;
+  selectedEnvProfileName.value = "";
+  editingEnvProfileName.value = "";
+  envPreview.value = "";
+  Object.assign(envProfileForm, {
+    name: "",
+    target_dir: target,
+    tunnel_ports: [],
+    extra_env: [],
+  });
+}
+
 function openEditEnvDialog(profile: EnvProfileConfig) {
   loadEnvProfile(profile.name);
   envDialogVisible.value = true;
+}
+
+function switchEnvProfileInDialog(name: string | null) {
+  if (name) {
+    loadEnvProfile(name);
+  }
 }
 
 function loadEnvProfile(name: string) {
@@ -955,54 +954,29 @@ function normalizeEnvName(value: string) {
   return normalized.replace(/^[0-9]/, "_$&");
 }
 
-function addEnvTunnelPort() {
-  const tunnel = tunnels.value.find((item) => item.id === envBindingTunnelId.value);
-  if (!tunnel) {
-    toast.add({ severity: "warn", summary: "Select a tunnel", life: 3000 });
-    return;
+function addEnvTunnelPortRow() {
+  const tunnel = tunnels.value[0];
+  envProfileForm.tunnel_ports.push({
+    tunnel_id: tunnel?.id ?? "",
+    alias: tunnel ? defaultPortAlias(tunnel) : "",
+    env_key: "",
+  });
+}
+
+function updateEnvTunnelPort(binding: EnvTunnelPort, tunnelId: string | null) {
+  binding.tunnel_id = tunnelId ?? "";
+  const tunnel = tunnels.value.find((item) => item.id === tunnelId);
+  if (tunnel && !binding.alias.trim()) {
+    binding.alias = defaultPortAlias(tunnel);
   }
-  const alias = normalizeEnvName(envBindingAlias.value.trim() || defaultPortAlias(tunnel));
-  const binding = {
-    tunnel_id: tunnel.id,
-    alias,
-    env_key: optional(envBindingEnvKey.value ? normalizeEnvName(envBindingEnvKey.value) : null),
-  };
-  const existingIndex = envProfileForm.tunnel_ports.findIndex((item) => normalizeEnvName(item.alias) === alias);
-  if (existingIndex >= 0) {
-    envProfileForm.tunnel_ports.splice(existingIndex, 1, binding);
-    toast.add({ severity: "info", summary: `Updated tunnel port ${alias}`, life: 2600 });
-  } else {
-    envProfileForm.tunnel_ports.push(binding);
-  }
-  envBindingTunnelId.value = "";
-  envBindingAlias.value = "";
-  envBindingEnvKey.value = "";
 }
 
 function removeEnvTunnelPort(index: number) {
   envProfileForm.tunnel_ports.splice(index, 1);
 }
 
-function addExtraEnv() {
-  if (!extraEnvKey.value.trim()) {
-    toast.add({ severity: "warn", summary: "Env key is required", life: 3000 });
-    return;
-  }
-  if (/[\r\n]/.test(extraEnvValue.value)) {
-    toast.add({ severity: "warn", summary: "Env value cannot contain newlines", life: 3000 });
-    return;
-  }
-  const key = normalizeEnvName(extraEnvKey.value);
-  const entry = { key, value: extraEnvValue.value };
-  const existingIndex = envProfileForm.extra_env.findIndex((item) => normalizeEnvName(item.key) === key);
-  if (existingIndex >= 0) {
-    envProfileForm.extra_env.splice(existingIndex, 1, entry);
-    toast.add({ severity: "info", summary: `Updated env ${key}`, life: 2600 });
-  } else {
-    envProfileForm.extra_env.push(entry);
-  }
-  extraEnvKey.value = "";
-  extraEnvValue.value = "";
+function addExtraEnvRow() {
+  envProfileForm.extra_env.push({ key: "", value: "" });
 }
 
 function removeExtraEnv(index: number) {
@@ -1369,44 +1343,54 @@ onMounted(bootstrap);
           <pre>{{ envPreview }}</pre>
         </div>
 
-        <Dialog v-model:visible="envDialogVisible" modal :header="selectedEnvProfileName ? `Edit ${selectedEnvProfileName}` : 'Add Env'" class="env-dialog">
+        <Dialog v-model:visible="envDialogVisible" modal :header="`Env: ${projectFolderName(envProfileForm.target_dir || selectedEnvTargetDir)}`" class="env-dialog">
           <div class="dialog-stack form">
-            <div class="env-profile-grid">
+            <div class="env-editor-header">
+              <label>
+                Config
+                <Select
+                  :model-value="selectedEnvProfileName"
+                  :options="envDialogProfileOptions"
+                  optionLabel="label"
+                  optionValue="value"
+                  placeholder="New env"
+                  @update:model-value="switchEnvProfileInDialog"
+                />
+              </label>
               <label>Env name<InputText v-model="envProfileForm.name" placeholder="test" /></label>
-              <label>Project<InputText :model-value="projectFolderName(envProfileForm.target_dir || selectedEnvTargetDir)" readonly /></label>
+              <Button label="New Env" icon="pi pi-plus" outlined type="button" @click="newEnvProfileInDialog" />
+              <Button label="Save" icon="pi pi-save" type="button" @click="saveEnvProfile(true, true)" />
             </div>
 
             <div class="panel nested-panel">
-              <h3>Tunnel Port Bindings</h3>
-              <div class="env-profile-grid">
-                <label>
-                  Server
-                  <Select v-model="envBindingServer" :options="envBindingServerOptions" optionLabel="label" optionValue="value" placeholder="Any server" />
-                </label>
-                <label>
-                  Compose project
-                  <Select v-model="envBindingProject" :options="envBindingProjectOptions" optionLabel="label" optionValue="value" placeholder="Any project" />
-                </label>
-                <label>
-                  Tunnel
-                  <Select v-model="envBindingTunnelId" :options="envBindingTunnelOptions" optionLabel="label" optionValue="value" placeholder="Select tunnel" />
-                </label>
-                <label>Port variable name<InputText v-model="envBindingAlias" placeholder="server_name_container_name" /></label>
-                <label>Env key using port<InputText v-model="envBindingEnvKey" placeholder="DATABASE_PORT" /></label>
-              </div>
-              <div class="toolbar">
-                <Button label="Add Tunnel Port" icon="pi pi-plus" outlined @click="addEnvTunnelPort" />
+              <div class="env-section-header">
+                <h3>Tunnel Ports</h3>
+                <Button label="Add Port" icon="pi pi-plus" size="small" outlined @click="addEnvTunnelPortRow" />
               </div>
               <DataTable :value="envProfileForm.tunnel_ports" size="small" stripedRows>
-                <Column field="tunnel_id" header="Tunnel" />
-                <Column field="alias" header="Port variable" />
-                <Column header="Env key">
-                  <template #body="{ data }">{{ data.env_key || "" }}</template>
-                </Column>
-                <Column header="Output">
+                <template #empty>
+                  <div class="empty-state">No tunnel ports.</div>
+                </template>
+                <Column header="Tunnel">
                   <template #body="{ data }">
-                    <code v-if="data.env_key">{{ data.env_key }}=&lt;local-port&gt;</code>
-                    <code v-else>{{ data.alias }}=&lt;local-port&gt;</code>
+                    <Select
+                      :model-value="data.tunnel_id"
+                      :options="envTunnelOptions"
+                      optionLabel="label"
+                      optionValue="value"
+                      placeholder="Select tunnel"
+                      @update:model-value="(value) => updateEnvTunnelPort(data, value)"
+                    />
+                  </template>
+                </Column>
+                <Column header="Port variable">
+                  <template #body="{ data }">
+                    <InputText v-model="data.alias" placeholder="server_db" />
+                  </template>
+                </Column>
+                <Column header="Env key">
+                  <template #body="{ data }">
+                    <InputText v-model="data.env_key" placeholder="DATABASE_PORT" />
                   </template>
                 </Column>
                 <Column header="">
@@ -1418,17 +1402,24 @@ onMounted(bootstrap);
             </div>
 
             <div class="panel nested-panel">
-              <h3>Extra Env</h3>
-              <div class="env-profile-grid">
-                <label>Key<InputText v-model="extraEnvKey" placeholder="DATABASE_HOST" /></label>
-                <label>Value<InputText v-model="extraEnvValue" placeholder="postgres://127.0.0.1:${server_name_container_name}/app" /></label>
-              </div>
-              <div class="toolbar">
-                <Button label="Add Env" icon="pi pi-plus" outlined @click="addExtraEnv" />
+              <div class="env-section-header">
+                <h3>Extra Env</h3>
+                <Button label="Add Variable" icon="pi pi-plus" size="small" outlined @click="addExtraEnvRow" />
               </div>
               <DataTable :value="envProfileForm.extra_env" size="small" stripedRows>
-                <Column field="key" header="Key" />
-                <Column field="value" header="Value" />
+                <template #empty>
+                  <div class="empty-state">No extra env variables.</div>
+                </template>
+                <Column header="Key">
+                  <template #body="{ data }">
+                    <InputText v-model="data.key" placeholder="DATABASE_HOST" />
+                  </template>
+                </Column>
+                <Column header="Value">
+                  <template #body="{ data }">
+                    <InputText v-model="data.value" placeholder="127.0.0.1" />
+                  </template>
+                </Column>
                 <Column header="">
                   <template #body="{ index }">
                     <Button icon="pi pi-trash" label="Remove" size="small" severity="danger" text @click="removeExtraEnv(index)" />
@@ -1437,9 +1428,6 @@ onMounted(bootstrap);
               </DataTable>
             </div>
 
-            <div class="toolbar env-dialog-actions">
-              <Button label="Save" icon="pi pi-save" @click="saveEnvProfile(true, true)" />
-            </div>
           </div>
         </Dialog>
       </section>
