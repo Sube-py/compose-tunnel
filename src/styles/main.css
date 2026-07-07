@@ -412,6 +412,22 @@ nav {
   gap: 16px;
 }
 
+.entity-dialog {
+  width: min(760px, calc(100vw - 32px));
+}
+
+.dialog-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .dialog-stack > .toolbar:last-child {
   position: sticky;
   bottom: -1px;
@@ -436,6 +452,10 @@ code {
   }
 
   .env-editor-header {
+    grid-template-columns: 1fr;
+  }
+
+  .dialog-grid {
     grid-template-columns: 1fr;
   }
 

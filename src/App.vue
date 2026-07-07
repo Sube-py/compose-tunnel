@@ -130,6 +130,8 @@ const selectedServer = ref("");
 const selectedProject = ref("");
 const envPreview = ref("");
 const editingServerName = ref("");
+const serverDialogVisible = ref(false);
+const tunnelDialogVisible = ref(false);
 const selectedEnvTargetDir = ref("");
 const selectedEnvProfileName = ref("");
 const editingEnvProfileName = ref("");
@@ -315,6 +317,7 @@ async function saveServer() {
     }
     await invoke("save_server", { server });
     clearServerForm();
+    serverDialogVisible.value = false;
     await refreshServers();
   });
 }
@@ -375,7 +378,12 @@ function editServer(server: ServerConfig) {
     default_socat_image: server.default_socat_image ?? "",
     docker_command: server.docker_command || "docker",
   });
-  toast.add({ severity: "info", summary: `Editing server ${server.name}`, life: 2200 });
+  serverDialogVisible.value = true;
+}
+
+function openNewServerDialog() {
+  clearServerForm();
+  serverDialogVisible.value = true;
 }
 
 function applyDockerCommandPreset(value: string) {
@@ -423,6 +431,7 @@ function pickService(service: ComposeService) {
     tunnelForm.target_port = port;
   }
   activeTab.value = "Tunnels";
+  tunnelDialogVisible.value = true;
 }
 
 async function openTunnel() {
@@ -442,8 +451,13 @@ async function openTunnel() {
       },
     });
     tunnelForm.local_port = "";
+    tunnelDialogVisible.value = false;
     await refreshTunnels();
   });
+}
+
+function openTunnelDialog() {
+  tunnelDialogVisible.value = true;
 }
 
 async function onTunnelServerChange() {
@@ -1156,29 +1170,16 @@ onMounted(bootstrap);
         </DataTable>
       </section>
 
-      <section v-if="activeTab === 'Servers'" class="page split">
-        <form class="panel form" @submit.prevent="saveServer">
-          <h3>{{ editingServerName ? `Edit ${editingServerName}` : 'Server' }}</h3>
-          <label>Name<InputText v-model="serverForm.name" required /></label>
-          <label>Host<InputText v-model="serverForm.host" required /></label>
-          <label>User<InputText v-model="serverForm.user" required /></label>
-          <label>Port<InputNumber v-model="serverForm.port" :min="1" :useGrouping="false" fluid /></label>
-          <label>Identity file<InputText v-model="serverForm.identity_file" placeholder="~/.ssh/id_ed25519" /></label>
-          <label>SSH config alias<InputText v-model="serverForm.ssh_alias" placeholder="staging" /></label>
-          <label>
-            Docker mode
-            <Select :modelValue="dockerCommandPreset" :options="dockerModeOptions" optionLabel="label" optionValue="value" @update:modelValue="onDockerModeChange" />
-          </label>
-          <label>Docker command<InputText v-model="serverForm.docker_command" required /></label>
-          <label>Default socat image<InputText v-model="serverForm.default_socat_image" placeholder="alpine/socat:latest" /></label>
-          <div class="toolbar">
-            <Button :label="editingServerName ? 'Update' : 'Save'" icon="pi pi-save" type="submit" />
-            <Button :label="editingServerName ? 'Cancel' : 'Clear'" severity="secondary" outlined type="button" @click="clearServerForm" />
-          </div>
-        </form>
+      <section v-if="activeTab === 'Servers'" class="page">
         <div class="panel">
-          <h3>Servers</h3>
+          <div class="row-between">
+            <h3>Servers</h3>
+            <Button label="Add Server" icon="pi pi-plus" @click="openNewServerDialog" />
+          </div>
           <DataTable :value="servers" size="small" stripedRows>
+            <template #empty>
+              <div class="empty-state">No servers yet.</div>
+            </template>
             <Column field="name" header="Name" />
             <Column header="Host">
               <template #body="{ data }">{{ data.host }}:{{ data.port }}</template>
@@ -1196,6 +1197,29 @@ onMounted(bootstrap);
             </Column>
           </DataTable>
         </div>
+
+        <Dialog v-model:visible="serverDialogVisible" modal :header="editingServerName ? `Edit ${editingServerName}` : 'Add Server'" class="entity-dialog">
+          <form class="form dialog-stack" @submit.prevent="saveServer">
+            <div class="dialog-grid">
+              <label>Name<InputText v-model="serverForm.name" required /></label>
+              <label>Host<InputText v-model="serverForm.host" required /></label>
+              <label>User<InputText v-model="serverForm.user" required /></label>
+              <label>Port<InputNumber v-model="serverForm.port" :min="1" :useGrouping="false" fluid /></label>
+              <label>Identity file<InputText v-model="serverForm.identity_file" placeholder="~/.ssh/id_ed25519" /></label>
+              <label>SSH config alias<InputText v-model="serverForm.ssh_alias" placeholder="staging" /></label>
+              <label>
+                Docker mode
+                <Select :modelValue="dockerCommandPreset" :options="dockerModeOptions" optionLabel="label" optionValue="value" @update:modelValue="onDockerModeChange" />
+              </label>
+              <label>Docker command<InputText v-model="serverForm.docker_command" required /></label>
+              <label>Default socat image<InputText v-model="serverForm.default_socat_image" placeholder="alpine/socat:latest" /></label>
+            </div>
+            <div class="dialog-actions">
+              <Button label="Cancel" severity="secondary" outlined type="button" @click="serverDialogVisible = false" />
+              <Button :label="editingServerName ? 'Update' : 'Save'" icon="pi pi-save" type="submit" />
+            </div>
+          </form>
+        </Dialog>
       </section>
 
       <section v-if="activeTab === 'Compose'" class="page">
@@ -1222,41 +1246,20 @@ onMounted(bootstrap);
         </DataTable>
       </section>
 
-      <section v-if="activeTab === 'Tunnels'" class="page split">
-        <form class="panel form" @submit.prevent="openTunnel">
-          <h3>Create Tunnel</h3>
-          <label>
-            Server
-            <Select v-model="tunnelForm.server" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" @update:modelValue="onTunnelServerChange" />
-          </label>
-          <label>
-            Project
-            <Select v-model="tunnelForm.project" :options="tunnelProjectOptions" optionLabel="project" optionValue="project" placeholder="Select project" @update:modelValue="onTunnelProjectChange" />
-          </label>
-          <label>
-            Service container
-            <Select v-model="tunnelForm.service" :options="tunnelServiceOptions" optionLabel="container" optionValue="service" placeholder="Select service" @update:modelValue="onTunnelServiceChange" />
-          </label>
-          <label>
-            Network
-            <Select v-if="selectedTunnelService" v-model="tunnelForm.network" :options="selectedTunnelService.networks" placeholder="Select network" />
-            <InputText v-else v-model="tunnelForm.network" placeholder="myapp_default" />
-          </label>
-          <label>Target port<InputNumber v-model="tunnelForm.target_port" :min="1" :useGrouping="false" fluid /></label>
-          <label>Local port<InputText v-model="tunnelForm.local_port" placeholder="auto assign" /></label>
-          <label>Env prefix<InputText v-model="tunnelForm.env_prefix" placeholder="DATABASE" /></label>
-          <label>socat image<InputText v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
-          <Button label="Start" icon="pi pi-play" type="submit" />
-        </form>
+      <section v-if="activeTab === 'Tunnels'" class="page">
         <div class="panel">
           <div class="row-between">
             <h3>Tunnels</h3>
             <div class="toolbar">
+              <Button label="Create Tunnel" icon="pi pi-plus" @click="openTunnelDialog" />
               <Select v-model="selectedServer" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" />
               <Button label="Cleanup" icon="pi pi-trash" severity="danger" outlined @click="cleanupSelectedServer" />
             </div>
           </div>
           <DataTable :value="tunnels" size="small" stripedRows>
+            <template #empty>
+              <div class="empty-state">No tunnels yet.</div>
+            </template>
             <Column field="id" header="ID" />
             <Column header="Remote"><template #body="{ data }">{{ data.server }} / {{ data.project }} / {{ data.service }}:{{ data.target_port }}</template></Column>
             <Column header="Local"><template #body="{ data }">{{ data.local_host }}:{{ data.local_port }}</template></Column>
@@ -1289,6 +1292,38 @@ onMounted(bootstrap);
             </Column>
           </DataTable>
         </div>
+
+        <Dialog v-model:visible="tunnelDialogVisible" modal header="Create Tunnel" class="entity-dialog">
+          <form class="form dialog-stack" @submit.prevent="openTunnel">
+            <div class="dialog-grid">
+              <label>
+                Server
+                <Select v-model="tunnelForm.server" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" @update:modelValue="onTunnelServerChange" />
+              </label>
+              <label>
+                Project
+                <Select v-model="tunnelForm.project" :options="tunnelProjectOptions" optionLabel="project" optionValue="project" placeholder="Select project" @update:modelValue="onTunnelProjectChange" />
+              </label>
+              <label>
+                Service container
+                <Select v-model="tunnelForm.service" :options="tunnelServiceOptions" optionLabel="container" optionValue="service" placeholder="Select service" @update:modelValue="onTunnelServiceChange" />
+              </label>
+              <label>
+                Network
+                <Select v-if="selectedTunnelService" v-model="tunnelForm.network" :options="selectedTunnelService.networks" placeholder="Select network" />
+                <InputText v-else v-model="tunnelForm.network" placeholder="myapp_default" />
+              </label>
+              <label>Target port<InputNumber v-model="tunnelForm.target_port" :min="1" :useGrouping="false" fluid /></label>
+              <label>Local port<InputText v-model="tunnelForm.local_port" placeholder="auto assign" /></label>
+              <label>Env prefix<InputText v-model="tunnelForm.env_prefix" placeholder="DATABASE" /></label>
+              <label>socat image<InputText v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
+            </div>
+            <div class="dialog-actions">
+              <Button label="Cancel" severity="secondary" outlined type="button" @click="tunnelDialogVisible = false" />
+              <Button label="Start" icon="pi pi-play" type="submit" />
+            </div>
+          </form>
+        </Dialog>
       </section>
 
       <section v-if="activeTab === 'Env'" class="page">
