@@ -501,7 +501,7 @@ pub async fn set_active_env_profile(name: String) -> Result<()> {
 }
 
 pub async fn list_tunnels() -> Result<Vec<TunnelState>> {
-    Ok(load_state().await?.tunnels)
+    Ok(load_refreshed_state().await?.tunnels)
 }
 
 pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
@@ -834,7 +834,7 @@ pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect();
-    let state = load_state().await?;
+    let state = load_refreshed_state().await?;
     let containers = cleanup_candidates(containers, &state, &server_id);
 
     if !containers.is_empty() {
@@ -1433,6 +1433,69 @@ async fn upsert_tunnel_state(tunnel: TunnelState) -> Result<()> {
     save_state(&state).await
 }
 
+async fn load_refreshed_state() -> Result<AppState> {
+    let mut state = load_state().await?;
+    let changed = refresh_tunnel_process_statuses(&mut state, pid_is_running);
+    if changed {
+        save_state(&state).await?;
+    }
+    Ok(state)
+}
+
+fn refresh_tunnel_process_statuses<F>(state: &mut AppState, mut pid_running: F) -> bool
+where
+    F: FnMut(u32) -> bool,
+{
+    let mut changed = false;
+    for tunnel in &mut state.tunnels {
+        if tunnel.status != TunnelStatus::Running {
+            continue;
+        }
+
+        match tunnel.ssh_pid {
+            Some(pid) if pid_running(pid) => {}
+            Some(pid) => {
+                tunnel.status = TunnelStatus::Stopped;
+                tunnel.ssh_pid = None;
+                tunnel.last_error = Some(format!("ssh process {pid} is not running"));
+                changed = true;
+            }
+            None => {
+                tunnel.status = TunnelStatus::Error;
+                tunnel.last_error = Some("running tunnel has no ssh process id".to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.contains(&format!("\"{pid}\"")))
+    }
+}
+
 async fn kill_pid(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1634,6 +1697,107 @@ mod tests {
                 "compose-tunnel-staging-app-redis-6379".to_string(),
                 "compose-tunnel-orphan".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn refresh_tunnel_status_marks_dead_ssh_process_as_stopped() {
+        let mut state = AppState {
+            tunnels: vec![TunnelState {
+                id: "db".to_string(),
+                server: "staging".to_string(),
+                project: "app".to_string(),
+                service: "db".to_string(),
+                network: "app_default".to_string(),
+                target_port: 5432,
+                socat_port: 5432,
+                local_host: "127.0.0.1".to_string(),
+                local_port: 15432,
+                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+                socat_container_ip: "172.18.0.20".to_string(),
+                ssh_pid: Some(1234),
+                status: TunnelStatus::Running,
+                mode: TunnelMode::SocatDirect,
+                env_prefix: None,
+                started_at: None,
+                last_error: None,
+            }],
+        };
+
+        let changed = refresh_tunnel_process_statuses(&mut state, |_| false);
+
+        assert!(changed);
+        assert_eq!(state.tunnels[0].status, TunnelStatus::Stopped);
+        assert_eq!(state.tunnels[0].ssh_pid, None);
+        assert_eq!(
+            state.tunnels[0].last_error.as_deref(),
+            Some("ssh process 1234 is not running")
+        );
+    }
+
+    #[test]
+    fn refresh_tunnel_status_keeps_live_ssh_process_running() {
+        let mut state = AppState {
+            tunnels: vec![TunnelState {
+                id: "db".to_string(),
+                server: "staging".to_string(),
+                project: "app".to_string(),
+                service: "db".to_string(),
+                network: "app_default".to_string(),
+                target_port: 5432,
+                socat_port: 5432,
+                local_host: "127.0.0.1".to_string(),
+                local_port: 15432,
+                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+                socat_container_ip: "172.18.0.20".to_string(),
+                ssh_pid: Some(1234),
+                status: TunnelStatus::Running,
+                mode: TunnelMode::SocatDirect,
+                env_prefix: None,
+                started_at: None,
+                last_error: None,
+            }],
+        };
+
+        let changed = refresh_tunnel_process_statuses(&mut state, |_| true);
+
+        assert!(!changed);
+        assert_eq!(state.tunnels[0].status, TunnelStatus::Running);
+        assert_eq!(state.tunnels[0].ssh_pid, Some(1234));
+        assert_eq!(state.tunnels[0].last_error, None);
+    }
+
+    #[test]
+    fn refresh_tunnel_status_marks_running_without_pid_as_error() {
+        let mut state = AppState {
+            tunnels: vec![TunnelState {
+                id: "db".to_string(),
+                server: "staging".to_string(),
+                project: "app".to_string(),
+                service: "db".to_string(),
+                network: "app_default".to_string(),
+                target_port: 5432,
+                socat_port: 5432,
+                local_host: "127.0.0.1".to_string(),
+                local_port: 15432,
+                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+                socat_container_ip: "172.18.0.20".to_string(),
+                ssh_pid: None,
+                status: TunnelStatus::Running,
+                mode: TunnelMode::SocatDirect,
+                env_prefix: None,
+                started_at: None,
+                last_error: None,
+            }],
+        };
+
+        let changed = refresh_tunnel_process_statuses(&mut state, |_| true);
+
+        assert!(changed);
+        assert_eq!(state.tunnels[0].status, TunnelStatus::Error);
+        assert_eq!(
+            state.tunnels[0].last_error.as_deref(),
+            Some("running tunnel has no ssh process id")
         );
     }
 
