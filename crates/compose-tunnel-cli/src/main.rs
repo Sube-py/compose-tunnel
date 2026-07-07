@@ -144,7 +144,7 @@ enum EnvProfileCommand {
     Save(EnvProfileSaveArgs),
     Show { name: String },
     Use { name: String },
-    Write { name: String },
+    Write(EnvProfileWriteArgs),
     Delete { name: String },
 }
 
@@ -157,6 +157,13 @@ struct EnvProfileSaveArgs {
     tunnel_ports: Vec<String>,
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct EnvProfileWriteArgs {
+    name: String,
+    #[arg(long)]
+    yes: bool,
 }
 
 #[tokio::main]
@@ -344,10 +351,22 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
             set_active_env_profile(name.clone()).await?;
             println!("Activated env profile {name}");
         }
-        EnvProfileCommand::Write { name } => {
-            set_active_env_profile(name.clone()).await?;
-            let path = write_env_profile(WriteEnvProfileRequest { name: name.clone() }).await?;
-            println!("Wrote env profile {name} to {}", path.display());
+        EnvProfileCommand::Write(args) => {
+            let env = render_env_profile(args.name.clone()).await?;
+            let sensitive_keys = sensitive_env_keys(&env);
+            if !sensitive_keys.is_empty()
+                && !args.yes
+                && !confirm_sensitive_env_write(&sensitive_keys)?
+            {
+                println!("Env profile write cancelled");
+                return Ok(());
+            }
+            set_active_env_profile(args.name.clone()).await?;
+            let path = write_env_profile(WriteEnvProfileRequest {
+                name: args.name.clone(),
+            })
+            .await?;
+            println!("Wrote env profile {} to {}", args.name, path.display());
         }
         EnvProfileCommand::Delete { name } => {
             delete_env_profile(name.clone()).await?;
@@ -400,6 +419,64 @@ fn confirm_cleanup() -> anyhow::Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+fn confirm_sensitive_env_write(keys: &[String]) -> anyhow::Result<bool> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("env profile write requires --yes when sensitive keys are present and stdin is not interactive");
+    }
+
+    println!(
+        "Env profile contains sensitive key(s): {}",
+        format_sensitive_keys(keys)
+    );
+    print!("Write these values to .env? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn sensitive_env_keys(env: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in env.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let lowered = key.to_ascii_lowercase();
+        let is_sensitive = lowered.contains("password")
+            || lowered.contains("token")
+            || lowered.contains("secret")
+            || lowered.contains("private_key")
+            || lowered.contains("private-key");
+        if is_sensitive && !keys.iter().any(|existing| existing == key) {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
+fn format_sensitive_keys(keys: &[String]) -> String {
+    let visible = keys
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hidden_count = keys.len().saturating_sub(5);
+    if hidden_count > 0 {
+        format!("{visible}, and {hidden_count} more")
+    } else {
+        visible
+    }
 }
 
 async fn handle_server(command: ServerCommand) -> anyhow::Result<()> {
@@ -567,5 +644,60 @@ mod tests {
             }
             _ => panic!("expected cleanup command"),
         }
+    }
+
+    #[test]
+    fn parses_env_profile_write_yes() {
+        let cli = Cli::try_parse_from([
+            "compose-tunnel",
+            "env",
+            "profile",
+            "write",
+            "staging-db",
+            "--yes",
+        ])
+        .expect("env profile write yes should parse");
+
+        match cli.command {
+            Command::Env(args) => match args.command {
+                Some(EnvCommand::Profile {
+                    command: EnvProfileCommand::Write(write_args),
+                }) => {
+                    assert_eq!(write_args.name, "staging-db");
+                    assert!(write_args.yes);
+                }
+                _ => panic!("expected env profile write command"),
+            },
+            _ => panic!("expected env command"),
+        }
+    }
+
+    #[test]
+    fn sensitive_env_keys_are_detected_and_deduplicated() {
+        let keys = sensitive_env_keys(
+            "DATABASE_PASSWORD=secret\nDATABASE_PASSWORD=secret\nAPI_TOKEN=token\nSAFE=value\n",
+        );
+
+        assert_eq!(
+            keys,
+            vec!["DATABASE_PASSWORD".to_string(), "API_TOKEN".to_string()]
+        );
+    }
+
+    #[test]
+    fn sensitive_env_key_list_is_compacted() {
+        let keys = vec![
+            "A_PASSWORD".to_string(),
+            "B_TOKEN".to_string(),
+            "C_SECRET".to_string(),
+            "D_PRIVATE_KEY".to_string(),
+            "E_PASSWORD".to_string(),
+            "F_TOKEN".to_string(),
+        ];
+
+        assert_eq!(
+            format_sensitive_keys(&keys),
+            "A_PASSWORD, B_TOKEN, C_SECRET, D_PRIVATE_KEY, E_PASSWORD, and 1 more"
+        );
     }
 }

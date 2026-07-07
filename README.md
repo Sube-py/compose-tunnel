@@ -36,6 +36,7 @@ cargo run -p compose-tunnel-cli -- env profile save staging-db --target-dir ./my
 cargo run -p compose-tunnel-cli -- env profile show staging-db
 cargo run -p compose-tunnel-cli -- env profile use staging-db
 cargo run -p compose-tunnel-cli -- env profile write staging-db
+cargo run -p compose-tunnel-cli -- env profile write staging-db --yes
 cargo run -p compose-tunnel-cli -- env profile delete staging-db
 cargo run -p compose-tunnel-cli -- close db
 cargo run -p compose-tunnel-cli -- cleanup --server staging --dry-run
@@ -65,7 +66,7 @@ Click **Use Env** to make that profile active for its target directory. Only one
 
 The CLI can create, update, inspect, use, write, and delete the same env profiles with `compose-tunnel env profile save`, `list`, `show`, `use`, `write`, and `delete`.
 
-The desktop app asks for confirmation before writing extra env keys that look sensitive, such as `PASSWORD`, `TOKEN`, `SECRET`, or `PRIVATE_KEY`.
+The CLI and desktop app ask for confirmation before writing extra env keys that look sensitive, such as `PASSWORD`, `TOKEN`, `SECRET`, or `PRIVATE_KEY`. Use `--yes` with `compose-tunnel env profile write` for non-interactive scripts.
 
 ## Cleanup
 
