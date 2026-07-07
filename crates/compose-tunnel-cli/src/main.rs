@@ -109,6 +109,8 @@ struct CloseArgs {
     tunnel_id: Option<String>,
     #[arg(long)]
     all: bool,
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -213,6 +215,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Close(args) => {
             if args.all {
+                if !args.yes
+                    && !confirm_dangerous_action(
+                        "close --all requires --yes when stdin is not interactive",
+                        "Stop all tunnels and remove their remote socat containers? [y/N] ",
+                    )?
+                {
+                    println!("Close all cancelled");
+                    return Ok(());
+                }
                 close_all_tunnels().await?;
                 println!("All tunnels stopped");
             } else if let Some(tunnel_id) = args.tunnel_id {
@@ -245,7 +256,12 @@ async fn main() -> anyhow::Result<()> {
             for container in &preview.containers {
                 println!("  {container}");
             }
-            if !args.yes && !confirm_cleanup()? {
+            if !args.yes
+                && !confirm_dangerous_action(
+                    "cleanup requires --yes when stdin is not interactive",
+                    "Remove these remote containers? [y/N] ",
+                )?
+            {
                 println!("Cleanup cancelled");
                 return Ok(());
             }
@@ -406,12 +422,12 @@ fn parse_plain_env(value: &str) -> anyhow::Result<EnvPlainEntry> {
     })
 }
 
-fn confirm_cleanup() -> anyhow::Result<bool> {
+fn confirm_dangerous_action(non_interactive_message: &str, prompt: &str) -> anyhow::Result<bool> {
     if !io::stdin().is_terminal() {
-        anyhow::bail!("cleanup requires --yes when stdin is not interactive");
+        anyhow::bail!(non_interactive_message.to_string());
     }
 
-    print!("Remove these remote containers? [y/N] ");
+    print!("{prompt}");
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -627,6 +643,20 @@ mod tests {
                 assert!(args.dry_run);
             }
             _ => panic!("expected cleanup command"),
+        }
+    }
+
+    #[test]
+    fn parses_close_all_yes() {
+        let cli = Cli::try_parse_from(["compose-tunnel", "close", "--all", "--yes"])
+            .expect("close all yes should parse");
+
+        match cli.command {
+            Command::Close(args) => {
+                assert!(args.all);
+                assert!(args.yes);
+            }
+            _ => panic!("expected close command"),
         }
     }
 
