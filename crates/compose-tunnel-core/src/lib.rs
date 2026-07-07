@@ -712,6 +712,14 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         .env_prefix
         .clone()
         .or_else(|| Some(default_env_prefix(&request.service)));
+    let existing_state = load_state().await?;
+    let tunnel_id = tunnel_state_id(
+        &existing_state,
+        &request.server,
+        &request.project,
+        &request.service,
+        request.target_port,
+    );
 
     ensure_socat_container(
         &config.defaults,
@@ -751,7 +759,7 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
     let ssh_pid = child.id();
 
     let state = TunnelState {
-        id: request.service.clone(),
+        id: tunnel_id,
         server: request.server.clone(),
         project: request.project.clone(),
         service: request.service.clone(),
@@ -1185,6 +1193,42 @@ fn tunnel_container_name(server: &str, project: &str, service: &str, target_port
     )
 }
 
+fn tunnel_state_id(
+    state: &AppState,
+    server: &str,
+    project: &str,
+    service: &str,
+    target_port: u16,
+) -> String {
+    let base = service.to_string();
+    match state.tunnels.iter().find(|tunnel| tunnel.id == base) {
+        None => base,
+        Some(existing) if same_tunnel_target(existing, server, project, service, target_port) => {
+            base
+        }
+        Some(_) => format!(
+            "{}-{}-{}-{}",
+            sanitize_name(server),
+            sanitize_name(project),
+            sanitize_name(service),
+            target_port
+        ),
+    }
+}
+
+fn same_tunnel_target(
+    tunnel: &TunnelState,
+    server: &str,
+    project: &str,
+    service: &str,
+    target_port: u16,
+) -> bool {
+    tunnel.server == server
+        && tunnel.project == project
+        && tunnel.service == service
+        && tunnel.target_port == target_port
+}
+
 fn sanitize_name(value: &str) -> String {
     value
         .chars()
@@ -1590,6 +1634,37 @@ mod tests {
                 "compose-tunnel-staging-app-redis-6379".to_string(),
                 "compose-tunnel-orphan".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn tunnel_id_scopes_when_service_id_already_belongs_to_another_target() {
+        let state = AppState {
+            tunnels: vec![TunnelState {
+                id: "db".to_string(),
+                server: "staging".to_string(),
+                project: "app".to_string(),
+                service: "db".to_string(),
+                network: "app_default".to_string(),
+                target_port: 5432,
+                socat_port: 5432,
+                local_host: "127.0.0.1".to_string(),
+                local_port: 15432,
+                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+                socat_container_ip: "172.18.0.20".to_string(),
+                ssh_pid: Some(1234),
+                status: TunnelStatus::Running,
+                mode: TunnelMode::SocatDirect,
+                env_prefix: None,
+                started_at: None,
+                last_error: None,
+            }],
+        };
+
+        assert_eq!(tunnel_state_id(&state, "staging", "app", "db", 5432), "db");
+        assert_eq!(
+            tunnel_state_id(&state, "staging", "billing", "db", 5432),
+            "staging-billing-db-5432"
         );
     }
 
