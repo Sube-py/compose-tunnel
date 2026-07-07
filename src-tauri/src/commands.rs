@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use compose_tunnel_core::{
     active_env_profile as core_active_env_profile, active_env_profiles as core_active_env_profiles,
-    cleanup as core_cleanup, close_tunnel as core_close_tunnel,
-    delete_env_profile as core_delete_env_profile, delete_server as core_delete_server,
-    init_config as core_init_config, list_compose_projects as core_list_compose_projects,
+    cleanup as core_cleanup, close_all_tunnels as core_close_all_tunnels,
+    close_tunnel as core_close_tunnel, delete_env_profile as core_delete_env_profile,
+    delete_server as core_delete_server, init_config as core_init_config,
+    list_compose_projects as core_list_compose_projects,
     list_compose_services as core_list_compose_services,
     list_env_profiles as core_list_env_profiles, list_servers as core_list_servers,
     list_tunnels as core_list_tunnels, load_config, open_tunnel as core_open_tunnel,
@@ -113,6 +114,11 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> CommandResult<TunnelStat
 #[tauri::command]
 pub async fn close_tunnel(tunnel_id: String) -> CommandResult<()> {
     core_close_tunnel(tunnel_id).await.map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn close_all_tunnels() -> CommandResult<()> {
+    core_close_all_tunnels().await.map_err(map_error)
 }
 
 #[tauri::command]

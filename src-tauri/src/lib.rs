@@ -23,6 +23,7 @@ pub fn run() {
             commands::list_compose_services,
             commands::open_tunnel,
             commands::close_tunnel,
+            commands::close_all_tunnels,
             commands::list_tunnels,
             commands::render_env,
             commands::write_env_file,

@@ -427,6 +427,13 @@ async function closeTunnel(id: string) {
   });
 }
 
+async function stopAllTunnels() {
+  await runTask("Stopped all tunnels", async () => {
+    await invoke("close_all_tunnels");
+    await refreshTunnels();
+  });
+}
+
 async function startTunnel(tunnel: TunnelState) {
   await runTask(`Started tunnel ${tunnel.id}`, async () => {
     await openTunnelFromState(tunnel, null);
@@ -837,6 +844,7 @@ onMounted(bootstrap);
           <Button label="Add Server" icon="pi pi-server" outlined @click="setTab('Servers')" />
           <Button label="Discover Compose" icon="pi pi-search" outlined @click="setTab('Compose')" />
           <Button label="Open Tunnel" icon="pi pi-share-alt" outlined @click="setTab('Tunnels')" />
+          <Button label="Stop All" icon="pi pi-stop" severity="danger" outlined :disabled="runningCount === 0" @click="stopAllTunnels" />
         </div>
         <DataTable :value="tunnels" size="small" stripedRows>
           <Column field="id" header="ID" />
