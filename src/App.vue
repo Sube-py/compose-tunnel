@@ -87,6 +87,11 @@ type EnvProfileConfig = {
   extra_env: EnvPlainEntry[];
 };
 
+type CleanupResult = {
+  server: string;
+  containers: string[];
+};
+
 const tabs = ["Dashboard", "Servers", "Compose", "Tunnels", "Env", "Logs", "Settings"] as const;
 type Tab = (typeof tabs)[number];
 
@@ -432,6 +437,29 @@ async function stopAllTunnels() {
     await invoke("close_all_tunnels");
     await refreshTunnels();
   });
+}
+
+async function cleanupSelectedServer() {
+  if (!selectedServer.value) {
+    toast.add({ severity: "warn", summary: "Select a server first", life: 3000 });
+    return;
+  }
+  const result = await runTask(
+    `Cleaned up ${selectedServer.value}`,
+    async () => invoke<CleanupResult>("cleanup", { serverId: selectedServer.value }),
+    false,
+  );
+  if (!result) {
+    return;
+  }
+  const detail = result.containers.length
+    ? `${result.containers.length} containers removed`
+    : "No compose-tunnel containers found";
+  logs.value.unshift(
+    `${new Date().toLocaleTimeString()} Cleanup ${result.server}: ${result.containers.join(", ") || "nothing to remove"}`,
+  );
+  toast.add({ severity: "success", summary: "Cleanup complete", detail, life: 3600 });
+  await refreshTunnels();
 }
 
 async function startTunnel(tunnel: TunnelState) {
@@ -953,7 +981,13 @@ onMounted(bootstrap);
           <Button label="Start" icon="pi pi-play" type="submit" />
         </form>
         <div class="panel">
-          <h3>Tunnels</h3>
+          <div class="row-between">
+            <h3>Tunnels</h3>
+            <div class="toolbar">
+              <Select v-model="selectedServer" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" />
+              <Button label="Cleanup" icon="pi pi-trash" severity="danger" outlined @click="cleanupSelectedServer" />
+            </div>
+          </div>
           <DataTable :value="tunnels" size="small" stripedRows>
             <Column field="id" header="ID" />
             <Column header="Remote"><template #body="{ data }">{{ data.server }} / {{ data.project }} / {{ data.service }}:{{ data.target_port }}</template></Column>
