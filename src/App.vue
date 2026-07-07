@@ -447,6 +447,40 @@ async function startTunnel(tunnel: TunnelState) {
   });
 }
 
+async function copyTunnelEnv(tunnel: TunnelState) {
+  const env = await runTask(
+    `Copied env for ${tunnel.id}`,
+    async () => {
+      const output = await invoke<string>("render_env", { tunnelId: tunnel.id });
+      await copyText(output.trimEnd());
+      return output;
+    },
+    false,
+  );
+  if (env !== null) {
+    toast.add({ severity: "success", summary: "Env copied", detail: tunnel.id, life: 2400 });
+  }
+}
+
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) {
+    throw new Error("clipboard copy failed");
+  }
+}
+
 async function saveDefaultSettings() {
   await runTask("Saved settings", async () => {
     await invoke("save_defaults", { defaults: { ...defaults } });
@@ -907,16 +941,19 @@ onMounted(bootstrap);
             <Column header="Status"><template #body="{ data }"><Tag :value="data.status" :severity="statusSeverity(data.status)" /></template></Column>
             <Column header="">
               <template #body="{ data }">
-                <Button
-                  v-if="data.status === 'running'"
-                  label="Stop"
-                  icon="pi pi-stop"
-                  size="small"
-                  severity="danger"
-                  outlined
-                  @click="closeTunnel(data.id)"
-                />
-                <Button v-else label="Start" icon="pi pi-play" size="small" severity="success" outlined @click="startTunnel(data)" />
+                <div class="actions">
+                  <Button icon="pi pi-copy" label="Copy env" size="small" text @click="copyTunnelEnv(data)" />
+                  <Button
+                    v-if="data.status === 'running'"
+                    label="Stop"
+                    icon="pi pi-stop"
+                    size="small"
+                    severity="danger"
+                    outlined
+                    @click="closeTunnel(data.id)"
+                  />
+                  <Button v-else label="Start" icon="pi pi-play" size="small" severity="success" outlined @click="startTunnel(data)" />
+                </div>
               </template>
             </Column>
           </DataTable>
