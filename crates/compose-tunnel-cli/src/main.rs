@@ -44,7 +44,7 @@ enum ServerCommand {
     Add(ServerAddArgs),
     List,
     Test { name: String },
-    Delete { name: String },
+    Delete(ServerDeleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -64,6 +64,13 @@ struct ServerAddArgs {
     socat_image: Option<String>,
     #[arg(long, default_value = "docker")]
     docker_command: String,
+}
+
+#[derive(Debug, Args)]
+struct ServerDeleteArgs {
+    name: String,
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -534,9 +541,18 @@ async fn handle_server(command: ServerCommand) -> anyhow::Result<()> {
                 println!("  {detail}");
             }
         }
-        ServerCommand::Delete { name } => {
-            delete_server(name.clone()).await?;
-            println!("Deleted server {name}");
+        ServerCommand::Delete(args) => {
+            if !args.yes
+                && !confirm_dangerous_action(
+                    "server delete requires --yes when stdin is not interactive",
+                    "Delete this server config? Existing tunnels and env profiles may still reference it. [y/N] ",
+                )?
+            {
+                println!("Server delete cancelled");
+                return Ok(());
+            }
+            delete_server(args.name.clone()).await?;
+            println!("Deleted server {}", args.name);
         }
     }
     Ok(())
@@ -657,6 +673,22 @@ mod tests {
                 assert!(args.yes);
             }
             _ => panic!("expected close command"),
+        }
+    }
+
+    #[test]
+    fn parses_server_delete_yes() {
+        let cli = Cli::try_parse_from(["compose-tunnel", "server", "delete", "staging", "--yes"])
+            .expect("server delete yes should parse");
+
+        match cli.command {
+            Command::Server {
+                command: ServerCommand::Delete(args),
+            } => {
+                assert_eq!(args.name, "staging");
+                assert!(args.yes);
+            }
+            _ => panic!("expected server delete command"),
         }
     }
 

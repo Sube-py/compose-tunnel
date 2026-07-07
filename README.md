@@ -26,6 +26,7 @@ cargo run -p compose-tunnel-cli -- init
 cargo run -p compose-tunnel-cli -- server add staging --host staging.example.com --user deploy
 cargo run -p compose-tunnel-cli -- server add staging-sudo --host staging.example.com --user deploy --docker-command "sudo -n docker"
 cargo run -p compose-tunnel-cli -- server test staging
+cargo run -p compose-tunnel-cli -- server delete staging --yes
 cargo run -p compose-tunnel-cli -- compose list --server staging
 cargo run -p compose-tunnel-cli -- compose services --server staging --project myapp
 cargo run -p compose-tunnel-cli -- open --server staging --project myapp --service db --target-port 5432
