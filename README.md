@@ -53,8 +53,8 @@ The desktop Env page is list-first. Use **Add Env** to open a PrimeVue dialog, c
 For a tunnel binding, the port variable name can be referenced by other env keys:
 
 ```env
-staging-db=15432
-DATABASE_PORT=${staging-db}
+staging_db=15432
+DATABASE_PORT=${staging_db}
 DATABASE_HOST=127.0.0.1
 ```
 

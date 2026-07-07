@@ -597,7 +597,7 @@ async function chooseEnvDirectory() {
 }
 
 function defaultPortAlias(tunnel: TunnelState) {
-  return `${tunnel.server}-${tunnel.service}`.replace(/[^A-Za-z0-9_-]/g, "_");
+  return `${tunnel.server}_${tunnel.service}`.replace(/[^A-Za-z0-9_]/g, "_").replace(/^[0-9]/, "_$&");
 }
 
 function portReference(alias: string) {
@@ -998,7 +998,7 @@ onMounted(bootstrap);
                   Tunnel
                   <Select v-model="envBindingTunnelId" :options="envBindingTunnelOptions" optionLabel="label" optionValue="value" placeholder="Select tunnel" />
                 </label>
-                <label>Port variable name<InputText v-model="envBindingAlias" placeholder="server_name-container_name" /></label>
+                <label>Port variable name<InputText v-model="envBindingAlias" placeholder="server_name_container_name" /></label>
                 <label>Env key using port<InputText v-model="envBindingEnvKey" placeholder="DATABASE_PORT" /></label>
               </div>
               <div class="toolbar">

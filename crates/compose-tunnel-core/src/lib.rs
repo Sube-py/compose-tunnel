@@ -438,6 +438,16 @@ pub async fn save_env_profile(profile: EnvProfileConfig) -> Result<()> {
                 .unwrap_or(true)
     });
     profile.extra_env.retain(|item| !item.key.trim().is_empty());
+    for binding in &mut profile.tunnel_ports {
+        binding.alias = normalize_env_name(&binding.alias);
+        binding.env_key = binding
+            .env_key
+            .as_ref()
+            .map(|value| normalize_env_name(value));
+    }
+    for entry in &mut profile.extra_env {
+        entry.key = normalize_env_name(&entry.key);
+    }
     let profile_name = profile.name.clone();
 
     let mut config = load_config().await?;
@@ -1157,6 +1167,29 @@ fn default_env_prefix(service: &str) -> String {
         .collect()
 }
 
+fn normalize_env_name(value: &str) -> String {
+    let mut output: String = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if output
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_digit())
+        .unwrap_or(true)
+    {
+        output.insert(0, '_');
+    }
+    output
+}
+
 fn env_for_tunnel(tunnel: &TunnelState) -> String {
     let prefix = tunnel
         .env_prefix
@@ -1437,6 +1470,13 @@ mod tests {
     }
 
     #[test]
+    fn env_names_are_normalized_for_dotenv_output() {
+        assert_eq!(normalize_env_name("server-db"), "server_db");
+        assert_eq!(normalize_env_name("DATABASE-PORT"), "DATABASE_PORT");
+        assert_eq!(normalize_env_name("1_PORT"), "_1_PORT");
+    }
+
+    #[test]
     fn old_server_config_defaults_to_docker_command() {
         let raw = r#"
             [defaults]
@@ -1460,7 +1500,7 @@ mod tests {
             target_dir: Some(PathBuf::from("/tmp/app")),
             tunnel_ports: vec![EnvTunnelPort {
                 tunnel_id: "db".to_string(),
-                alias: "server-db".to_string(),
+                alias: "server_db".to_string(),
                 env_key: Some("DATABASE_PORT".to_string()),
             }],
             extra_env: vec![EnvPlainEntry {
@@ -1492,8 +1532,8 @@ mod tests {
 
         let rendered = render_env_profile_inner(&profile, &state).expect("profile should render");
 
-        assert!(rendered.contains("server-db=15432"));
-        assert!(rendered.contains("DATABASE_PORT=${server-db}"));
+        assert!(rendered.contains("server_db=15432"));
+        assert!(rendered.contains("DATABASE_PORT=${server_db}"));
         assert!(rendered.contains("DATABASE_HOST=127.0.0.1"));
     }
 
