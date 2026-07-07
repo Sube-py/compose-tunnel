@@ -521,6 +521,10 @@ async function saveEnvProfile(showToast = true, closeDialog = false) {
     toast.add({ severity: "warn", summary: "Env name is required", life: 3000 });
     return false;
   }
+  if (!envProfileForm.target_dir?.trim()) {
+    toast.add({ severity: "warn", summary: "Target directory is required", life: 3000 });
+    return false;
+  }
   const profile = compactEnvProfile();
   const originalName = editingEnvProfileName.value;
   const isRename = Boolean(originalName) && originalName !== profile.name;

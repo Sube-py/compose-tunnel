@@ -427,6 +427,7 @@ pub async fn active_env_profiles() -> Result<BTreeMap<String, String>> {
 pub async fn save_env_profile(profile: EnvProfileConfig) -> Result<()> {
     validate_name("env profile name", &profile.name)?;
     let mut profile = profile;
+    env_profile_target_key(&profile)?;
     profile.tunnel_ports.retain(|item| {
         !item.tunnel_id.trim().is_empty()
             && !item.alias.trim().is_empty()
@@ -1415,5 +1416,18 @@ mod tests {
 
         assert_eq!(active.get("/tmp/app"), Some(&"app-test".to_string()));
         assert_eq!(active.get("/tmp/admin"), Some(&"admin-prod".to_string()));
+    }
+
+    #[test]
+    fn env_profile_target_directory_is_required() {
+        let profile = EnvProfileConfig {
+            name: "test".to_string(),
+            target_dir: None,
+            ..EnvProfileConfig::default()
+        };
+
+        let error = env_profile_target_key(&profile).expect_err("target dir should be required");
+
+        assert_eq!(error.to_string(), "target directory is required");
     }
 }
