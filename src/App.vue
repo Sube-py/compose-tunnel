@@ -713,6 +713,26 @@ async function deleteEnvProfile(profile?: EnvProfileConfig) {
     toast.add({ severity: "warn", summary: "Select an env first", life: 3000 });
     return;
   }
+  confirm.require({
+    header: "Delete env profile",
+    message: `Delete env profile ${name}? This removes the saved compose-tunnel env configuration for its project directory.`,
+    icon: "pi pi-exclamation-triangle",
+    rejectProps: {
+      label: "Cancel",
+      severity: "secondary",
+      outlined: true,
+    },
+    acceptProps: {
+      label: "Delete",
+      severity: "danger",
+    },
+    accept: () => {
+      void runDeleteEnvProfile(name);
+    },
+  });
+}
+
+async function runDeleteEnvProfile(name: string) {
   await runTask(`Deleted env ${name}`, async () => {
     await invoke("delete_env_profile", { name });
     if (selectedEnvProfileName.value === name) {
