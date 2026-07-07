@@ -94,6 +94,7 @@ type EnvProjectRow = {
   target_dir: string;
   label: string;
   active_name: string;
+  selected_name: string;
   profile_count: number;
 };
 
@@ -124,6 +125,7 @@ const services = ref<ComposeService[]>([]);
 const tunnels = ref<TunnelState[]>([]);
 const envProfiles = ref<EnvProfileConfig[]>([]);
 const activeEnvProfiles = ref<Record<string, string>>({});
+const selectedEnvNames = ref<Record<string, string>>({});
 const selectedServer = ref("");
 const selectedProject = ref("");
 const envPreview = ref("");
@@ -222,6 +224,7 @@ const envProjectRows = computed<EnvProjectRow[]>(() => {
         target_dir: targetDir,
         label: projectFolderName(targetDir),
         active_name: activeEnvProfiles.value[targetDir] ?? "",
+        selected_name: selectedEnvNames.value[targetDir] ?? activeEnvProfiles.value[targetDir] ?? "",
         profile_count: 1,
       });
     }
@@ -231,6 +234,7 @@ const envProjectRows = computed<EnvProjectRow[]>(() => {
       target_dir: selectedEnvTargetDir.value,
       label: projectFolderName(selectedEnvTargetDir.value),
       active_name: activeEnvProfiles.value[selectedEnvTargetDir.value] ?? "",
+      selected_name: selectedEnvNames.value[selectedEnvTargetDir.value] ?? activeEnvProfiles.value[selectedEnvTargetDir.value] ?? "",
       profile_count: 0,
     });
   }
@@ -303,6 +307,12 @@ async function refreshTunnels() {
 async function refreshEnvProfiles() {
   envProfiles.value = await invoke<EnvProfileConfig[]>("list_env_profiles");
   activeEnvProfiles.value = await invoke<Record<string, string>>("active_env_profiles");
+  for (const profile of envProfiles.value) {
+    const target = envTargetKey(profile);
+    if (target && !selectedEnvNames.value[target]) {
+      selectedEnvNames.value[target] = activeEnvProfiles.value[target] ?? profile.name;
+    }
+  }
   if (!selectedEnvTargetDir.value && envProfiles.value.length > 0) {
     selectedEnvTargetDir.value = envTargetKey(envProfiles.value[0]);
   }
@@ -819,36 +829,6 @@ async function runDeleteEnvProfile(name: string) {
   });
 }
 
-async function activateEnvProfile(profile?: EnvProfileConfig) {
-  let name = profile?.name ?? envProfileForm.name.trim();
-  if (!profile) {
-    const saved = await saveEnvProfile(false);
-    if (!saved) {
-      return;
-    }
-    name = envProfileForm.name.trim();
-  }
-  await runTask(`Activated env ${name}`, async () => {
-    await invoke("set_active_env_profile", { name });
-    await refreshEnvProfiles();
-  });
-}
-
-async function activateEnvProfileName(name: string | null) {
-  if (!name) {
-    return;
-  }
-  await runTask(`Activated env ${name}`, async () => {
-    await invoke("set_active_env_profile", { name });
-    const path = await invoke<string>("write_env_profile", {
-      request: { name },
-    });
-    await refreshEnvProfiles();
-    envPreview.value = await invoke<string>("render_env_profile", { name });
-    toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
-  }, false);
-}
-
 async function chooseEnvProject() {
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected === "string") {
@@ -870,13 +850,24 @@ function envOptionsForProject(project: EnvProjectRow) {
   }));
 }
 
+function selectEnvForProject(project: EnvProjectRow, name: string | null) {
+  if (name) {
+    selectedEnvNames.value[project.target_dir] = name;
+  }
+}
+
 function activeProfileForProject(project: EnvProjectRow) {
   const activeName = activeEnvProfiles.value[project.target_dir] ?? "";
   return envProfiles.value.find((profile) => profile.name === activeName) ?? null;
 }
 
-function openEditActiveEnv(project: EnvProjectRow) {
-  const profile = activeProfileForProject(project) ?? profilesForProject(project)[0];
+function selectedProfileForProject(project: EnvProjectRow) {
+  const selectedName = selectedEnvNames.value[project.target_dir] || project.selected_name || project.active_name;
+  return envProfiles.value.find((profile) => profile.name === selectedName) ?? activeProfileForProject(project) ?? profilesForProject(project)[0] ?? null;
+}
+
+function openEditProjectEnv(project: EnvProjectRow) {
+  const profile = selectedProfileForProject(project);
   if (!profile) {
     toast.add({ severity: "warn", summary: "Add an env first", life: 3000 });
     return;
@@ -884,22 +875,75 @@ function openEditActiveEnv(project: EnvProjectRow) {
   openEditEnvDialog(profile);
 }
 
-async function previewActiveEnv(project: EnvProjectRow) {
-  const profile = activeProfileForProject(project);
+async function previewProjectEnv(project: EnvProjectRow) {
+  const profile = selectedProfileForProject(project);
   if (!profile) {
-    toast.add({ severity: "warn", summary: "Select an active env first", life: 3000 });
+    toast.add({ severity: "warn", summary: "Select an env first", life: 3000 });
     return;
   }
   await renderEnvProfilePreview(profile);
 }
 
 async function deleteActiveEnvForProject(project: EnvProjectRow) {
-  const profile = activeProfileForProject(project) ?? profilesForProject(project)[0];
+  const profile = selectedProfileForProject(project);
   if (!profile) {
     toast.add({ severity: "warn", summary: "Add an env first", life: 3000 });
     return;
   }
   await deleteEnvProfile(profile);
+}
+
+async function enableProjectEnv(project: EnvProjectRow) {
+  const profile = selectedProfileForProject(project);
+  if (!profile) {
+    toast.add({ severity: "warn", summary: "Select an env first", life: 3000 });
+    return;
+  }
+  const sensitiveKeys = sensitiveEnvKeys(profile);
+  if (sensitiveKeys.length > 0) {
+    confirm.require({
+      header: "Enable env with sensitive values",
+      message: `Start tunnels and write ${formatSensitiveEnvKeys(sensitiveKeys)} to this project's .env file?`,
+      icon: "pi pi-exclamation-triangle",
+      rejectProps: {
+        label: "Cancel",
+        severity: "secondary",
+        outlined: true,
+      },
+      acceptProps: {
+        label: "Enable",
+        severity: "danger",
+      },
+      accept: () => {
+        void runEnableProjectEnv(profile);
+      },
+    });
+    return;
+  }
+  await runEnableProjectEnv(profile);
+}
+
+async function runEnableProjectEnv(profile: EnvProfileConfig) {
+  await runTask(`Enabled env ${profile.name}`, async () => {
+    for (const binding of profile.tunnel_ports) {
+      const tunnel = tunnels.value.find((item) => item.id === binding.tunnel_id);
+      if (!tunnel) {
+        throw new Error(`Tunnel ${binding.tunnel_id} was not found`);
+      }
+      if (tunnel.status !== "running") {
+        await openTunnelFromState(tunnel, null);
+      }
+    }
+    await refreshTunnels();
+    await invoke("set_active_env_profile", { name: profile.name });
+    const path = await invoke<string>("write_env_profile", {
+      request: { name: profile.name },
+    });
+    await refreshEnvProfiles();
+    selectedEnvNames.value[envTargetKey(profile)] = profile.name;
+    envPreview.value = await invoke<string>("render_env_profile", { name: profile.name });
+    toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
+  }, false);
 }
 
 function defaultPortAlias(tunnel: TunnelState) {
@@ -980,52 +1024,6 @@ async function renderEnvProfilePreview(profile?: EnvProfileConfig) {
   if (result !== null) {
     envPreview.value = result;
   }
-}
-
-async function writeActiveEnvProfile(profile?: EnvProfileConfig) {
-  let name = profile?.name ?? envProfileForm.name.trim();
-  if (!profile) {
-    const saved = await saveEnvProfile(false);
-    if (!saved) {
-      return;
-    }
-    name = envProfileForm.name.trim();
-  }
-  const savedProfile = envProfiles.value.find((item) => item.name === name) ?? profile;
-  const sensitiveKeys = savedProfile ? sensitiveEnvKeys(savedProfile) : [];
-  if (sensitiveKeys.length > 0) {
-    confirm.require({
-      header: "Write sensitive env values",
-      message: `Write ${formatSensitiveEnvKeys(sensitiveKeys)} to this project's .env file?`,
-      icon: "pi pi-exclamation-triangle",
-      rejectProps: {
-        label: "Cancel",
-        severity: "secondary",
-        outlined: true,
-      },
-      acceptProps: {
-        label: "Write .env",
-        severity: "danger",
-      },
-      accept: () => {
-        void runWriteActiveEnvProfile(name);
-      },
-    });
-    return;
-  }
-  await runWriteActiveEnvProfile(name);
-}
-
-async function runWriteActiveEnvProfile(name: string) {
-  await runTask(`Wrote ${name} .env`, async () => {
-    await invoke("set_active_env_profile", { name });
-    const path = await invoke<string>("write_env_profile", {
-      request: { name },
-    });
-    await refreshEnvProfiles();
-    envPreview.value = await invoke<string>("render_env_profile", { name });
-    toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
-  }, false);
 }
 
 function sensitiveEnvKeys(profile: EnvProfileConfig) {
@@ -1340,24 +1338,22 @@ onMounted(bootstrap);
             <Column header="Active env">
               <template #body="{ data }">
                 <Select
-                  :model-value="data.active_name"
+                  :model-value="data.selected_name"
                   :options="envOptionsForProject(data)"
                   optionLabel="label"
                   optionValue="value"
                   placeholder="Select env"
                   class="env-select"
-                  @update:model-value="activateEnvProfileName"
+                  @update:model-value="(name) => selectEnvForProject(data, name)"
                 />
               </template>
-            </Column>
-            <Column header="Configs">
-              <template #body="{ data }">{{ data.profile_count }}</template>
             </Column>
             <Column header="Actions">
               <template #body="{ data }">
                 <div class="actions">
-                  <Button icon="pi pi-pencil" label="Edit" size="small" text @click="openEditActiveEnv(data)" />
-                  <Button icon="pi pi-eye" label="Preview" size="small" text @click="previewActiveEnv(data)" />
+                  <Button icon="pi pi-play" label="Enable" size="small" severity="success" outlined @click="enableProjectEnv(data)" />
+                  <Button icon="pi pi-pencil" label="Edit" size="small" text @click="openEditProjectEnv(data)" />
+                  <Button icon="pi pi-eye" label="Preview" size="small" text @click="previewProjectEnv(data)" />
                   <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteActiveEnvForProject(data)" />
                 </div>
               </template>
@@ -1442,9 +1438,6 @@ onMounted(bootstrap);
             </div>
 
             <div class="toolbar env-dialog-actions">
-              <Button label="Preview" icon="pi pi-eye" outlined @click="renderEnvProfilePreview()" />
-              <Button label="Use Env" icon="pi pi-check-circle" severity="success" outlined @click="activateEnvProfile()" />
-              <Button label="Write .env" icon="pi pi-file-export" outlined @click="writeActiveEnvProfile()" />
               <Button label="Save" icon="pi pi-save" @click="saveEnvProfile(true, true)" />
             </div>
           </div>
