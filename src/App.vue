@@ -90,6 +90,13 @@ type EnvProfileConfig = {
   extra_env: EnvPlainEntry[];
 };
 
+type EnvProjectRow = {
+  target_dir: string;
+  label: string;
+  active_name: string;
+  profile_count: number;
+};
+
 type CleanupResult = {
   server: string;
   containers: string[];
@@ -121,6 +128,7 @@ const selectedServer = ref("");
 const selectedProject = ref("");
 const envPreview = ref("");
 const editingServerName = ref("");
+const selectedEnvTargetDir = ref("");
 const selectedEnvProfileName = ref("");
 const editingEnvProfileName = ref("");
 const envDialogVisible = ref(false);
@@ -200,14 +208,41 @@ const envBindingTunnelOptions = computed(() =>
     })),
 );
 const envProfileRows = computed(() =>
-  [...envProfiles.value].sort((left, right) => {
-    const leftTarget = envTargetKey(left);
-    const rightTarget = envTargetKey(right);
-    if (leftTarget !== rightTarget) {
-      return leftTarget.localeCompare(rightTarget);
+  envProfiles.value
+    .filter((profile) => envTargetKey(profile) === selectedEnvTargetDir.value)
+    .sort((left, right) => left.name.localeCompare(right.name)),
+);
+const envProjectRows = computed<EnvProjectRow[]>(() => {
+  const projects = new Map<string, EnvProjectRow>();
+  for (const profile of envProfiles.value) {
+    const targetDir = envTargetKey(profile);
+    if (!targetDir) {
+      continue;
     }
-    return left.name.localeCompare(right.name);
-  }),
+    const existing = projects.get(targetDir);
+    if (existing) {
+      existing.profile_count += 1;
+    } else {
+      projects.set(targetDir, {
+        target_dir: targetDir,
+        label: projectFolderName(targetDir),
+        active_name: activeEnvProfiles.value[targetDir] ?? "",
+        profile_count: 1,
+      });
+    }
+  }
+  if (selectedEnvTargetDir.value && !projects.has(selectedEnvTargetDir.value)) {
+    projects.set(selectedEnvTargetDir.value, {
+      target_dir: selectedEnvTargetDir.value,
+      label: projectFolderName(selectedEnvTargetDir.value),
+      active_name: activeEnvProfiles.value[selectedEnvTargetDir.value] ?? "",
+      profile_count: 0,
+    });
+  }
+  return Array.from(projects.values()).sort((left, right) => left.label.localeCompare(right.label));
+});
+const selectedEnvProject = computed(
+  () => envProjectRows.value.find((project) => project.target_dir === selectedEnvTargetDir.value) ?? null,
 );
 const tunnelProjectOptions = computed(() =>
   projects.value.filter((project) => project.server === tunnelForm.server),
@@ -276,6 +311,9 @@ async function refreshTunnels() {
 async function refreshEnvProfiles() {
   envProfiles.value = await invoke<EnvProfileConfig[]>("list_env_profiles");
   activeEnvProfiles.value = await invoke<Record<string, string>>("active_env_profiles");
+  if (!selectedEnvTargetDir.value && envProfiles.value.length > 0) {
+    selectedEnvTargetDir.value = envTargetKey(envProfiles.value[0]);
+  }
   if (selectedEnvProfileName.value && envProfiles.value.some((profile) => profile.name === selectedEnvProfileName.value)) {
     loadEnvProfile(selectedEnvProfileName.value);
   }
@@ -656,13 +694,17 @@ function newEnvProfile() {
   extraEnvValue.value = "";
   Object.assign(envProfileForm, {
     name: "",
-    target_dir: "",
+    target_dir: selectedEnvTargetDir.value,
     tunnel_ports: [],
     extra_env: [],
   });
 }
 
 function openNewEnvDialog() {
+  if (!selectedEnvTargetDir.value) {
+    toast.add({ severity: "warn", summary: "Choose a project first", life: 3000 });
+    return;
+  }
   newEnvProfile();
   envDialogVisible.value = true;
 }
@@ -736,6 +778,7 @@ async function saveEnvProfile(showToast = true, closeDialog = false) {
         await invoke("set_active_env_profile", { name: profile.name });
       }
       await refreshEnvProfiles();
+      selectedEnvTargetDir.value = envTargetKey(profile);
       selectedEnvProfileName.value = profile.name;
       editingEnvProfileName.value = profile.name;
       loadEnvProfile(profile.name);
@@ -799,11 +842,20 @@ async function activateEnvProfile(profile?: EnvProfileConfig) {
   });
 }
 
-async function chooseEnvDirectory() {
+async function chooseEnvProject() {
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected === "string") {
-    envProfileForm.target_dir = selected;
+    selectedEnvTargetDir.value = selected;
+    newEnvProfile();
+    toast.add({ severity: "success", summary: `Selected project ${projectFolderName(selected)}`, life: 2600 });
   }
+}
+
+function selectEnvProject(project: EnvProjectRow) {
+  selectedEnvTargetDir.value = project.target_dir;
+  selectedEnvProfileName.value = "";
+  editingEnvProfileName.value = "";
+  envPreview.value = "";
 }
 
 function defaultPortAlias(tunnel: TunnelState) {
@@ -952,13 +1004,17 @@ function envTargetKey(profile: EnvProfileConfig) {
   return profile.target_dir?.trim() ?? "";
 }
 
-function envProjectLabel(profile: EnvProfileConfig) {
-  return envTargetKey(profile) || "Project directory not set";
-}
-
 function isActiveEnvProfile(profile: EnvProfileConfig) {
   const key = envTargetKey(profile);
   return Boolean(key) && activeEnvProfiles.value[key] === profile.name;
+}
+
+function projectFolderName(path: string) {
+  const normalized = path.trim().replace(/[\\/]+$/, "");
+  if (!normalized) {
+    return "Project";
+  }
+  return normalized.split(/[\\/]/).pop() || normalized;
 }
 
 function clearServerForm() {
@@ -1220,69 +1276,92 @@ onMounted(bootstrap);
       </section>
 
       <section v-if="activeTab === 'Env'" class="page">
-        <div class="panel">
-          <div class="row-between">
-            <h3>Env Profiles</h3>
-            <Button label="Add Env" icon="pi pi-plus" @click="openNewEnvDialog" />
+        <div class="env-layout">
+          <div class="panel env-projects-panel">
+            <div class="row-between">
+              <h3>Projects</h3>
+              <Button icon="pi pi-folder-plus" rounded outlined aria-label="Add project" @click="chooseEnvProject" />
+            </div>
+            <DataTable
+              :value="envProjectRows"
+              size="small"
+              stripedRows
+              selectionMode="single"
+              dataKey="target_dir"
+              :selection="selectedEnvProject"
+              class="env-project-table"
+              @row-click="selectEnvProject($event.data)"
+            >
+              <template #empty>
+                <div class="empty-state">Choose a project directory.</div>
+              </template>
+              <Column header="Project">
+                <template #body="{ data }">
+                  <div class="env-project-cell">
+                    <i class="pi pi-folder"></i>
+                    <div>
+                      <strong>{{ data.label }}</strong>
+                      <span>{{ data.profile_count }} env</span>
+                    </div>
+                  </div>
+                </template>
+              </Column>
+              <Column header="Active">
+                <template #body="{ data }">
+                  <Tag v-if="data.active_name" :value="data.active_name" severity="success" />
+                  <Tag v-else value="none" severity="secondary" />
+                </template>
+              </Column>
+            </DataTable>
           </div>
-          <DataTable
-            :value="envProfileRows"
-            size="small"
-            stripedRows
-            rowGroupMode="subheader"
-            groupRowsBy="target_dir"
-            sortField="target_dir"
-            :sortOrder="1"
-            class="env-table"
-          >
-            <template #groupheader="{ data }">
-              <div class="env-project-group">
-                <i class="pi pi-folder"></i>
-                <span>{{ envProjectLabel(data) }}</span>
+
+          <div class="panel">
+            <div class="row-between">
+              <div>
+                <h3>{{ selectedEnvProject?.label ?? "Env Profiles" }}</h3>
+                <p class="subtle">{{ selectedEnvProject ? `${selectedEnvProject.profile_count} env configs` : "Choose a project directory first" }}</p>
               </div>
-            </template>
-            <template #empty>
-              <div class="empty-state">No env profiles yet.</div>
-            </template>
-            <Column field="name" header="Name" />
-            <Column header="Project directory">
-              <template #body="{ data }">
-                <span class="breakable">{{ data.target_dir || "not set" }}</span>
+              <Button label="Add Env" icon="pi pi-plus" :disabled="!selectedEnvTargetDir" @click="openNewEnvDialog" />
+            </div>
+            <DataTable :value="envProfileRows" size="small" stripedRows class="env-table">
+              <template #empty>
+                <div class="empty-state">No env profiles for this project yet.</div>
               </template>
-            </Column>
-            <Column header="Active">
-              <template #body="{ data }">
-                <Tag v-if="isActiveEnvProfile(data)" value="active" severity="success" />
-                <Tag v-else value="inactive" severity="secondary" />
-              </template>
-            </Column>
-            <Column header="Tunnel ports">
-              <template #body="{ data }">{{ data.tunnel_ports.length }}</template>
-            </Column>
-            <Column header="Extra env">
-              <template #body="{ data }">{{ data.extra_env.length }}</template>
-            </Column>
-            <Column header="Actions">
-              <template #body="{ data }">
-                <div class="actions">
-                  <Button icon="pi pi-pencil" size="small" text rounded aria-label="Edit env" @click="openEditEnvDialog(data)" />
-                  <Button
-                    icon="pi pi-check-circle"
-                    size="small"
-                    severity="success"
-                    text
-                    rounded
-                    :aria-label="isActiveEnvProfile(data) ? 'Env already active' : 'Use env'"
-                    :disabled="isActiveEnvProfile(data)"
-                    @click="activateEnvProfile(data)"
-                  />
-                  <Button icon="pi pi-eye" size="small" text rounded aria-label="Preview env" @click="renderEnvProfilePreview(data)" />
-                  <Button icon="pi pi-file-export" size="small" text rounded aria-label="Write .env" @click="writeActiveEnvProfile(data)" />
-                  <Button icon="pi pi-trash" size="small" severity="danger" text rounded aria-label="Delete env" @click="deleteEnvProfile(data)" />
-                </div>
-              </template>
-            </Column>
-          </DataTable>
+              <Column field="name" header="Env" />
+              <Column header="Active">
+                <template #body="{ data }">
+                  <Tag v-if="isActiveEnvProfile(data)" value="active" severity="success" />
+                  <Tag v-else value="inactive" severity="secondary" />
+                </template>
+              </Column>
+              <Column header="Tunnel ports">
+                <template #body="{ data }">{{ data.tunnel_ports.length }}</template>
+              </Column>
+              <Column header="Extra env">
+                <template #body="{ data }">{{ data.extra_env.length }}</template>
+              </Column>
+              <Column header="Actions">
+                <template #body="{ data }">
+                  <div class="actions">
+                    <Button icon="pi pi-pencil" size="small" text rounded aria-label="Edit env" @click="openEditEnvDialog(data)" />
+                    <Button
+                      icon="pi pi-check-circle"
+                      size="small"
+                      severity="success"
+                      text
+                      rounded
+                      :aria-label="isActiveEnvProfile(data) ? 'Env already active' : 'Use env'"
+                      :disabled="isActiveEnvProfile(data)"
+                      @click="activateEnvProfile(data)"
+                    />
+                    <Button icon="pi pi-eye" size="small" text rounded aria-label="Preview env" @click="renderEnvProfilePreview(data)" />
+                    <Button icon="pi pi-file-export" size="small" text rounded aria-label="Write .env" @click="writeActiveEnvProfile(data)" />
+                    <Button icon="pi pi-trash" size="small" severity="danger" text rounded aria-label="Delete env" @click="deleteEnvProfile(data)" />
+                  </div>
+                </template>
+              </Column>
+            </DataTable>
+          </div>
         </div>
 
         <div v-if="envPreview" class="panel">
@@ -1297,13 +1376,7 @@ onMounted(bootstrap);
           <div class="dialog-stack form">
             <div class="env-profile-grid">
               <label>Env name<InputText v-model="envProfileForm.name" placeholder="test" /></label>
-              <label>
-                Project directory
-                <div class="inline-field">
-                  <InputText v-model="envProfileForm.target_dir" placeholder="/path/to/app" />
-                  <Button label="Choose" icon="pi pi-folder-open" outlined @click="chooseEnvDirectory" />
-                </div>
-              </label>
+              <label>Project<InputText :model-value="projectFolderName(envProfileForm.target_dir || selectedEnvTargetDir)" readonly /></label>
             </div>
 
             <div class="panel nested-panel">
