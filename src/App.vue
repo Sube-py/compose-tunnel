@@ -806,11 +806,16 @@ async function chooseEnvDirectory() {
 }
 
 function defaultPortAlias(tunnel: TunnelState) {
-  return `${tunnel.server}_${tunnel.service}`.replace(/[^A-Za-z0-9_]/g, "_").replace(/^[0-9]/, "_$&");
+  return normalizeEnvName(`${tunnel.server}_${tunnel.service}`);
 }
 
 function portReference(alias: string) {
   return `\${${alias}}`;
+}
+
+function normalizeEnvName(value: string) {
+  const normalized = value.trim().replace(/[^A-Za-z0-9_]/g, "_");
+  return normalized.replace(/^[0-9]/, "_$&");
 }
 
 function addEnvTunnelPort() {
@@ -819,12 +824,19 @@ function addEnvTunnelPort() {
     toast.add({ severity: "warn", summary: "Select a tunnel", life: 3000 });
     return;
   }
-  const alias = (envBindingAlias.value || defaultPortAlias(tunnel)).trim();
-  envProfileForm.tunnel_ports.push({
+  const alias = normalizeEnvName(envBindingAlias.value.trim() || defaultPortAlias(tunnel));
+  const binding = {
     tunnel_id: tunnel.id,
     alias,
-    env_key: optional(envBindingEnvKey.value),
-  });
+    env_key: optional(envBindingEnvKey.value ? normalizeEnvName(envBindingEnvKey.value) : null),
+  };
+  const existingIndex = envProfileForm.tunnel_ports.findIndex((item) => normalizeEnvName(item.alias) === alias);
+  if (existingIndex >= 0) {
+    envProfileForm.tunnel_ports.splice(existingIndex, 1, binding);
+    toast.add({ severity: "info", summary: `Updated tunnel port ${alias}`, life: 2600 });
+  } else {
+    envProfileForm.tunnel_ports.push(binding);
+  }
   envBindingTunnelId.value = "";
   envBindingAlias.value = "";
   envBindingEnvKey.value = "";
@@ -843,7 +855,15 @@ function addExtraEnv() {
     toast.add({ severity: "warn", summary: "Env value cannot contain newlines", life: 3000 });
     return;
   }
-  envProfileForm.extra_env.push({ key: extraEnvKey.value.trim(), value: extraEnvValue.value });
+  const key = normalizeEnvName(extraEnvKey.value);
+  const entry = { key, value: extraEnvValue.value };
+  const existingIndex = envProfileForm.extra_env.findIndex((item) => normalizeEnvName(item.key) === key);
+  if (existingIndex >= 0) {
+    envProfileForm.extra_env.splice(existingIndex, 1, entry);
+    toast.add({ severity: "info", summary: `Updated env ${key}`, life: 2600 });
+  } else {
+    envProfileForm.extra_env.push(entry);
+  }
   extraEnvKey.value = "";
   extraEnvValue.value = "";
 }
