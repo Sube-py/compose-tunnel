@@ -839,6 +839,10 @@ function addExtraEnv() {
     toast.add({ severity: "warn", summary: "Env key is required", life: 3000 });
     return;
   }
+  if (/[\r\n]/.test(extraEnvValue.value)) {
+    toast.add({ severity: "warn", summary: "Env value cannot contain newlines", life: 3000 });
+    return;
+  }
   envProfileForm.extra_env.push({ key: extraEnvKey.value.trim(), value: extraEnvValue.value });
   extraEnvKey.value = "";
   extraEnvValue.value = "";

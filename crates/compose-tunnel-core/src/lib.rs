@@ -426,28 +426,7 @@ pub async fn active_env_profiles() -> Result<BTreeMap<String, String>> {
 
 pub async fn save_env_profile(profile: EnvProfileConfig) -> Result<()> {
     validate_name("env profile name", &profile.name)?;
-    let mut profile = profile;
-    profile.target_dir = Some(env_profile_target_dir(&profile)?);
-    profile.tunnel_ports.retain(|item| {
-        !item.tunnel_id.trim().is_empty()
-            && !item.alias.trim().is_empty()
-            && item
-                .env_key
-                .as_ref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(true)
-    });
-    profile.extra_env.retain(|item| !item.key.trim().is_empty());
-    for binding in &mut profile.tunnel_ports {
-        binding.alias = normalize_env_name(&binding.alias);
-        binding.env_key = binding
-            .env_key
-            .as_ref()
-            .map(|value| normalize_env_name(value));
-    }
-    for entry in &mut profile.extra_env {
-        entry.key = normalize_env_name(&entry.key);
-    }
+    let profile = normalize_env_profile(profile)?;
     let profile_name = profile.name.clone();
 
     let mut config = load_config().await?;
@@ -477,6 +456,37 @@ pub async fn save_env_profile(profile: EnvProfileConfig) -> Result<()> {
     }
     config.active_env_profile = None;
     save_config(&config).await
+}
+
+fn normalize_env_profile(mut profile: EnvProfileConfig) -> Result<EnvProfileConfig> {
+    profile.target_dir = Some(env_profile_target_dir(&profile)?);
+    profile.tunnel_ports.retain(|item| {
+        !item.tunnel_id.trim().is_empty()
+            && !item.alias.trim().is_empty()
+            && item
+                .env_key
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(true)
+    });
+    profile.extra_env.retain(|item| !item.key.trim().is_empty());
+    for binding in &mut profile.tunnel_ports {
+        binding.alias = normalize_env_name(&binding.alias);
+        binding.env_key = binding
+            .env_key
+            .as_ref()
+            .map(|value| normalize_env_name(value));
+    }
+    for entry in &mut profile.extra_env {
+        entry.key = normalize_env_name(&entry.key);
+        if entry.value.contains('\n') || entry.value.contains('\r') {
+            return Err(AppError::msg(format!(
+                "env value for {} may not contain newlines",
+                entry.key
+            )));
+        }
+    }
+    Ok(profile)
 }
 
 pub async fn delete_env_profile(name: String) -> Result<()> {
@@ -2024,5 +2034,25 @@ mod tests {
 
         assert!(target_dir.is_absolute());
         assert!(target_dir.ends_with("relative-app"));
+    }
+
+    #[test]
+    fn env_profile_plain_values_reject_newlines() {
+        let profile = EnvProfileConfig {
+            name: "test".to_string(),
+            target_dir: Some(PathBuf::from("/tmp/app")),
+            extra_env: vec![EnvPlainEntry {
+                key: "DATABASE_PASSWORD".to_string(),
+                value: "line1\nline2".to_string(),
+            }],
+            ..EnvProfileConfig::default()
+        };
+
+        let error = normalize_env_profile(profile).expect_err("newline should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "env value for DATABASE_PASSWORD may not contain newlines"
+        );
     }
 }
