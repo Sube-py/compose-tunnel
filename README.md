@@ -58,7 +58,7 @@ DATABASE_PORT=${staging-db}
 DATABASE_HOST=127.0.0.1
 ```
 
-Click **Use Env** to make that profile active for its target directory. Only one env is active per target directory, but different project directories can activate different env profiles at the same time. **Write .env** writes or updates the compose-tunnel managed block in the selected directory's `.env`.
+Click **Use Env** to make that profile active for its target directory. Only one env is active per target directory, but different project directories can activate different env profiles at the same time. **Write .env** writes or updates the single compose-tunnel env profile block in the selected directory's `.env`, replacing the previously written active env for that project.
 
 The CLI can create, update, inspect, and use the same env profiles with `compose-tunnel env profile save`, `list`, `show`, `use`, and `write`.
 

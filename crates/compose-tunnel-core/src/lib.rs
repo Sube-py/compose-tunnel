@@ -861,7 +861,7 @@ pub async fn write_env_profile(request: WriteEnvProfileRequest) -> Result<PathBu
         .ok_or_else(|| AppError::msg("target directory is required"))?;
     let env = render_env_profile(request.name.clone()).await?;
     let env_file = target_dir.join(".env");
-    write_managed_block(&env_file, &format!("env:{}", request.name), &env).await?;
+    write_env_profile_block(&env_file, &env).await?;
     Ok(env_file)
 }
 
@@ -1209,6 +1209,25 @@ async fn write_managed_block(path: &Path, tunnel_id: &str, env: &str) -> Result<
     Ok(())
 }
 
+async fn write_env_profile_block(path: &Path, env: &str) -> Result<()> {
+    let start = "# compose-tunnel:start env";
+    let end = "# compose-tunnel:end env";
+    let block = format!("{start}\n{}{end}\n", env.trim_end());
+    let existing = match fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    let cleaned = remove_env_profile_blocks(&existing);
+    let updated = replace_block(&cleaned, start, end, &block);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, updated).await?;
+    Ok(())
+}
+
 fn replace_block(existing: &str, start: &str, end: &str, block: &str) -> String {
     let Some(start_index) = existing.find(start) else {
         let separator = if existing.is_empty() || existing.ends_with('\n') {
@@ -1230,6 +1249,44 @@ fn replace_block(existing: &str, start: &str, end: &str, block: &str) -> String 
         output.push_str(rest.strip_prefix('\n').unwrap_or(rest));
     }
     output
+}
+
+fn remove_env_profile_blocks(existing: &str) -> String {
+    let mut output = String::new();
+    let mut skipping = false;
+
+    for line in existing.split_inclusive('\n') {
+        let line_text = line.trim_end_matches(['\r', '\n']);
+        if !skipping && is_env_profile_block_start(line_text) {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if is_env_profile_block_end(line_text) {
+                skipping = false;
+            }
+            continue;
+        }
+        output.push_str(line);
+    }
+
+    output
+}
+
+fn is_env_profile_block_start(line: &str) -> bool {
+    line.strip_prefix("# compose-tunnel:start ")
+        .map(is_env_profile_block_id)
+        .unwrap_or(false)
+}
+
+fn is_env_profile_block_end(line: &str) -> bool {
+    line.strip_prefix("# compose-tunnel:end ")
+        .map(is_env_profile_block_id)
+        .unwrap_or(false)
+}
+
+fn is_env_profile_block_id(block_id: &str) -> bool {
+    block_id == "env" || block_id.starts_with("env:")
 }
 
 async fn upsert_tunnel_state(tunnel: TunnelState) -> Result<()> {
@@ -1321,6 +1378,47 @@ mod tests {
         assert_eq!(
             updated,
             "A=1\n# compose-tunnel:start db\nDB_HOST=127.0.0.1\n# compose-tunnel:end db\nB=2\n"
+        );
+    }
+
+    #[test]
+    fn env_profile_block_replaces_previous_profile_blocks_only() {
+        let existing = [
+            "A=1\n",
+            "# compose-tunnel:start env:test\n",
+            "DATABASE_PORT=15432\n",
+            "# compose-tunnel:end env:test\n",
+            "# compose-tunnel:start db\n",
+            "DB_PORT=15432\n",
+            "# compose-tunnel:end db\n",
+            "# compose-tunnel:start env:prod\n",
+            "DATABASE_PORT=25432\n",
+            "# compose-tunnel:end env:prod\n",
+            "B=2\n",
+        ]
+        .concat();
+
+        let cleaned = remove_env_profile_blocks(&existing);
+        let updated = replace_block(
+            &cleaned,
+            "# compose-tunnel:start env",
+            "# compose-tunnel:end env",
+            "# compose-tunnel:start env\nDATABASE_PORT=35432\n# compose-tunnel:end env\n",
+        );
+
+        assert_eq!(
+            updated,
+            [
+                "A=1\n",
+                "# compose-tunnel:start db\n",
+                "DB_PORT=15432\n",
+                "# compose-tunnel:end db\n",
+                "B=2\n",
+                "# compose-tunnel:start env\n",
+                "DATABASE_PORT=35432\n",
+                "# compose-tunnel:end env\n",
+            ]
+            .concat()
         );
     }
 
