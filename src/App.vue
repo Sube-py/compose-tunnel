@@ -113,6 +113,7 @@ const selectedProject = ref("");
 const envPreview = ref("");
 const editingServerName = ref("");
 const selectedEnvProfileName = ref("");
+const editingEnvProfileName = ref("");
 const envDialogVisible = ref(false);
 const envBindingServer = ref("");
 const envBindingProject = ref("");
@@ -454,6 +455,7 @@ async function saveDefaultSettings() {
 
 function newEnvProfile() {
   selectedEnvProfileName.value = "";
+  editingEnvProfileName.value = "";
   envPreview.value = "";
   envBindingServer.value = "";
   envBindingProject.value = "";
@@ -487,6 +489,7 @@ function loadEnvProfile(name: string) {
     return;
   }
   selectedEnvProfileName.value = profile.name;
+  editingEnvProfileName.value = profile.name;
   envPreview.value = "";
   Object.assign(envProfileForm, {
     name: profile.name,
@@ -519,12 +522,28 @@ async function saveEnvProfile(showToast = true, closeDialog = false) {
     return false;
   }
   const profile = compactEnvProfile();
+  const originalName = editingEnvProfileName.value;
+  const isRename = Boolean(originalName) && originalName !== profile.name;
+  const nameExists = envProfiles.value.some((item) => item.name === profile.name && item.name !== originalName);
+  if (nameExists) {
+    toast.add({ severity: "warn", summary: `Env ${profile.name} already exists`, life: 3000 });
+    return false;
+  }
+  const originalProfile = originalName ? envProfiles.value.find((item) => item.name === originalName) : null;
+  const wasActive = originalProfile ? isActiveEnvProfile(originalProfile) : false;
   const result = await runTask(
     `Saved env ${profile.name}`,
     async () => {
+      if (isRename) {
+        await invoke("delete_env_profile", { name: originalName });
+      }
       await invoke("save_env_profile", { profile });
+      if (wasActive) {
+        await invoke("set_active_env_profile", { name: profile.name });
+      }
       await refreshEnvProfiles();
       selectedEnvProfileName.value = profile.name;
+      editingEnvProfileName.value = profile.name;
       loadEnvProfile(profile.name);
       if (closeDialog) {
         envDialogVisible.value = false;
