@@ -4,8 +4,9 @@ use clap::{Args, Parser, Subcommand};
 use compose_tunnel_core::{
     active_env_profiles, cleanup, close_all_tunnels, close_tunnel, delete_server, init_config,
     list_compose_projects, list_compose_services, list_env_profiles, list_servers, list_tunnels,
-    open_tunnel, render_env, render_env_profile, save_server, set_active_env_profile, test_server,
-    write_env_file, write_env_profile, OpenTunnelRequest, ServerConfig, WriteEnvFileRequest,
+    open_tunnel, render_env, render_env_profile, save_env_profile, save_server,
+    set_active_env_profile, test_server, write_env_file, write_env_profile, EnvPlainEntry,
+    EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest, ServerConfig, WriteEnvFileRequest,
     WriteEnvProfileRequest,
 };
 
@@ -130,9 +131,21 @@ enum EnvCommand {
 #[derive(Debug, Subcommand)]
 enum EnvProfileCommand {
     List,
+    Save(EnvProfileSaveArgs),
     Show { name: String },
     Use { name: String },
     Write { name: String },
+}
+
+#[derive(Debug, Args)]
+struct EnvProfileSaveArgs {
+    name: String,
+    #[arg(long)]
+    target_dir: PathBuf,
+    #[arg(long = "tunnel-port", value_name = "TUNNEL_ID:ALIAS[:ENV_KEY]")]
+    tunnel_ports: Vec<String>,
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
 }
 
 #[tokio::main]
@@ -272,6 +285,24 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
                 );
             }
         }
+        EnvProfileCommand::Save(args) => {
+            let profile = EnvProfileConfig {
+                name: args.name.clone(),
+                target_dir: Some(args.target_dir),
+                tunnel_ports: args
+                    .tunnel_ports
+                    .iter()
+                    .map(|value| parse_env_tunnel_port(value))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+                extra_env: args
+                    .env
+                    .iter()
+                    .map(|value| parse_plain_env(value))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            };
+            save_env_profile(profile).await?;
+            println!("Saved env profile {}", args.name);
+        }
         EnvProfileCommand::Show { name } => {
             print!("{}", render_env_profile(name).await?);
         }
@@ -286,6 +317,36 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_env_tunnel_port(value: &str) -> anyhow::Result<EnvTunnelPort> {
+    let parts: Vec<&str> = value.splitn(3, ':').collect();
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        anyhow::bail!("tunnel port must be TUNNEL_ID:ALIAS[:ENV_KEY]");
+    }
+    Ok(EnvTunnelPort {
+        tunnel_id: parts[0].trim().to_string(),
+        alias: parts[1].trim().to_string(),
+        env_key: parts
+            .get(2)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+    })
+}
+
+fn parse_plain_env(value: &str) -> anyhow::Result<EnvPlainEntry> {
+    let Some((key, entry_value)) = value.split_once('=') else {
+        anyhow::bail!("env must be KEY=VALUE");
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        anyhow::bail!("env key is required");
+    }
+    Ok(EnvPlainEntry {
+        key: key.to_string(),
+        value: entry_value.to_string(),
+    })
 }
 
 async fn handle_server(command: ServerCommand) -> anyhow::Result<()> {

@@ -32,6 +32,7 @@ cargo run -p compose-tunnel-cli -- open --server staging --project myapp --servi
 cargo run -p compose-tunnel-cli -- status
 cargo run -p compose-tunnel-cli -- env db
 cargo run -p compose-tunnel-cli -- env profile list
+cargo run -p compose-tunnel-cli -- env profile save staging-db --target-dir ./myapp --tunnel-port db:staging_db:DATABASE_PORT --env DATABASE_HOST=127.0.0.1
 cargo run -p compose-tunnel-cli -- env profile show staging-db
 cargo run -p compose-tunnel-cli -- env profile use staging-db
 cargo run -p compose-tunnel-cli -- env profile write staging-db
@@ -59,7 +60,7 @@ DATABASE_HOST=127.0.0.1
 
 Click **Use Env** to make that profile active for its target directory. Only one env is active per target directory, but different project directories can activate different env profiles at the same time. **Write .env** writes or updates the compose-tunnel managed block in the selected directory's `.env`.
 
-The CLI can inspect and use the same env profiles with `compose-tunnel env profile list`, `show`, `use`, and `write`.
+The CLI can create, update, inspect, and use the same env profiles with `compose-tunnel env profile save`, `list`, `show`, `use`, and `write`.
 
 ## Verify
 
