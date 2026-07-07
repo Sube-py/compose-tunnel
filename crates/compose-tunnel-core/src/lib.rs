@@ -725,8 +725,14 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
     )
     .await?;
     let socat_container_ip =
-        inspect_container_ip(&config.defaults, &server, &container, &network).await?;
-    let child = spawn_ssh_forward(
+        match inspect_container_ip(&config.defaults, &server, &container, &network).await {
+            Ok(ip) => ip,
+            Err(error) => {
+                let _ = remove_socat_container(&config.defaults, &server, &container).await;
+                return Err(error);
+            }
+        };
+    let child = match spawn_ssh_forward(
         &config.defaults,
         &server,
         &local_host,
@@ -734,7 +740,14 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         &socat_container_ip,
         socat_port,
     )
-    .await?;
+    .await
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = remove_socat_container(&config.defaults, &server, &container).await;
+            return Err(error);
+        }
+    };
     let ssh_pid = child.id();
 
     let state = TunnelState {
@@ -747,7 +760,7 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         socat_port,
         local_host,
         local_port,
-        socat_container: container,
+        socat_container: container.clone(),
         socat_container_ip,
         ssh_pid,
         status: TunnelStatus::Running,
@@ -757,7 +770,13 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         last_error: None,
     };
 
-    upsert_tunnel_state(state.clone()).await?;
+    if let Err(error) = upsert_tunnel_state(state.clone()).await {
+        if let Some(pid) = ssh_pid {
+            let _ = kill_pid(pid).await;
+        }
+        let _ = remove_socat_container(&config.defaults, &server, &container).await;
+        return Err(error);
+    }
     Ok(state)
 }
 
@@ -774,12 +793,7 @@ pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
             kill_pid(pid).await?;
         }
         if let Ok(server) = find_server(&config, &tunnel.server) {
-            let command = format!(
-                "{} rm -f {} >/dev/null 2>&1 || true",
-                docker_command(server),
-                shell_quote(&tunnel.socat_container)
-            );
-            let _ = run_ssh(&config.defaults, server, &command).await;
+            let _ = remove_socat_container(&config.defaults, server, &tunnel.socat_container).await;
         }
         tunnel.status = TunnelStatus::Stopped;
         tunnel.ssh_pid = None;
@@ -1097,6 +1111,19 @@ async fn inspect_container_ip(
         )));
     }
     Ok(ip.to_string())
+}
+
+async fn remove_socat_container(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    container: &str,
+) -> Result<()> {
+    let command = format!(
+        "{} rm -f {} >/dev/null 2>&1 || true",
+        docker_command(server),
+        shell_quote(container)
+    );
+    run_ssh(defaults, server, &command).await.map(|_| ())
 }
 
 fn choose_network(project: &str, service: &ComposeService) -> Result<String> {
