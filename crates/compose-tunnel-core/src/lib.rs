@@ -42,6 +42,12 @@ pub struct AppConfig {
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub profiles: Vec<ProfileConfig>,
+    #[serde(default)]
+    pub env_profiles: Vec<EnvProfileConfig>,
+    #[serde(default)]
+    pub active_env_profiles: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_env_profile: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -50,6 +56,9 @@ impl Default for AppConfig {
             defaults: Defaults::default(),
             servers: Vec::new(),
             profiles: Vec::new(),
+            env_profiles: Vec::new(),
+            active_env_profiles: BTreeMap::new(),
+            active_env_profile: None,
         }
     }
 }
@@ -150,6 +159,31 @@ pub struct EnvEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvProfileConfig {
+    pub name: String,
+    #[serde(default)]
+    pub target_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub tunnel_ports: Vec<EnvTunnelPort>,
+    #[serde(default)]
+    pub extra_env: Vec<EnvPlainEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvTunnelPort {
+    pub tunnel_id: String,
+    pub alias: String,
+    #[serde(default)]
+    pub env_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvPlainEntry {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppState {
     #[serde(default)]
     pub tunnels: Vec<TunnelState>,
@@ -232,6 +266,11 @@ pub struct OpenTunnelRequest {
 pub struct WriteEnvFileRequest {
     pub tunnel_id: String,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteEnvProfileRequest {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +407,85 @@ pub async fn delete_server(name: String) -> Result<()> {
 pub async fn save_defaults(defaults: Defaults) -> Result<()> {
     let mut config = load_config().await?;
     config.defaults = defaults;
+    save_config(&config).await
+}
+
+pub async fn list_env_profiles() -> Result<Vec<EnvProfileConfig>> {
+    Ok(load_config().await?.env_profiles)
+}
+
+pub async fn active_env_profile() -> Result<Option<String>> {
+    Ok(active_env_profiles_for_config(&load_config().await?)
+        .into_values()
+        .next())
+}
+
+pub async fn active_env_profiles() -> Result<BTreeMap<String, String>> {
+    Ok(active_env_profiles_for_config(&load_config().await?))
+}
+
+pub async fn save_env_profile(profile: EnvProfileConfig) -> Result<()> {
+    validate_name("env profile name", &profile.name)?;
+    let mut profile = profile;
+    profile.tunnel_ports.retain(|item| {
+        !item.tunnel_id.trim().is_empty()
+            && !item.alias.trim().is_empty()
+            && item
+                .env_key
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(true)
+    });
+    profile.extra_env.retain(|item| !item.key.trim().is_empty());
+    let profile_name = profile.name.clone();
+
+    let mut config = load_config().await?;
+    let was_active = active_env_profiles_for_config(&config)
+        .values()
+        .any(|active_name| active_name == &profile_name);
+    if let Some(existing) = config
+        .env_profiles
+        .iter_mut()
+        .find(|item| item.name == profile_name)
+    {
+        *existing = profile;
+    } else {
+        config.env_profiles.push(profile);
+    }
+    config
+        .env_profiles
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    config.active_env_profiles = active_env_profiles_for_config(&config);
+    config
+        .active_env_profiles
+        .retain(|_, active_name| active_name != &profile_name);
+    if was_active {
+        let saved = find_env_profile(&config, &profile_name)?;
+        let target_key = env_profile_target_key(saved)?;
+        config.active_env_profiles.insert(target_key, profile_name);
+    }
+    config.active_env_profile = None;
+    save_config(&config).await
+}
+
+pub async fn delete_env_profile(name: String) -> Result<()> {
+    let mut config = load_config().await?;
+    config.env_profiles.retain(|profile| profile.name != name);
+    config.active_env_profiles = active_env_profiles_for_config(&config);
+    config
+        .active_env_profiles
+        .retain(|_, active_name| active_name != &name);
+    config.active_env_profile = None;
+    save_config(&config).await
+}
+
+pub async fn set_active_env_profile(name: String) -> Result<()> {
+    let mut config = load_config().await?;
+    let profile = find_env_profile(&config, &name)?;
+    let target_key = env_profile_target_key(profile)?;
+    config.active_env_profiles = active_env_profiles_for_config(&config);
+    config.active_env_profiles.insert(target_key, name);
+    config.active_env_profile = None;
     save_config(&config).await
 }
 
@@ -718,12 +836,89 @@ pub async fn write_env_file(request: WriteEnvFileRequest) -> Result<()> {
     write_managed_block(&request.path, &request.tunnel_id, &env).await
 }
 
+pub async fn render_env_profile(name: String) -> Result<String> {
+    let config = load_config().await?;
+    let profile = find_env_profile(&config, &name)?;
+    let state = load_state().await?;
+    render_env_profile_inner(profile, &state)
+}
+
+pub async fn write_env_profile(request: WriteEnvProfileRequest) -> Result<PathBuf> {
+    let config = load_config().await?;
+    let profile = find_env_profile(&config, &request.name)?;
+    let target_key = env_profile_target_key(profile)?;
+    let active_profiles = active_env_profiles_for_config(&config);
+    if active_profiles.get(&target_key) != Some(&request.name) {
+        return Err(AppError::msg(format!(
+            "env profile {} is not active for {}",
+            request.name, target_key
+        )));
+    }
+    let target_dir = profile
+        .target_dir
+        .clone()
+        .ok_or_else(|| AppError::msg("target directory is required"))?;
+    let env = render_env_profile(request.name.clone()).await?;
+    let env_file = target_dir.join(".env");
+    write_managed_block(&env_file, &format!("env:{}", request.name), &env).await?;
+    Ok(env_file)
+}
+
 fn find_server<'a>(config: &'a AppConfig, name: &str) -> Result<&'a ServerConfig> {
     config
         .servers
         .iter()
         .find(|server| server.name == name)
         .ok_or_else(|| AppError::msg(format!("server {name} was not found")))
+}
+
+fn find_env_profile<'a>(config: &'a AppConfig, name: &str) -> Result<&'a EnvProfileConfig> {
+    config
+        .env_profiles
+        .iter()
+        .find(|profile| profile.name == name)
+        .ok_or_else(|| AppError::msg(format!("env profile {name} was not found")))
+}
+
+fn active_env_profiles_for_config(config: &AppConfig) -> BTreeMap<String, String> {
+    let mut active = config.active_env_profiles.clone();
+
+    if let Some(legacy_name) = &config.active_env_profile {
+        if active.values().all(|name| name != legacy_name) {
+            if let Some(profile) = config
+                .env_profiles
+                .iter()
+                .find(|profile| &profile.name == legacy_name)
+            {
+                if let Ok(target_key) = env_profile_target_key(profile) {
+                    active.insert(target_key, legacy_name.clone());
+                }
+            }
+        }
+    }
+
+    active.retain(|target_key, active_name| {
+        config
+            .env_profiles
+            .iter()
+            .find(|profile| &profile.name == active_name)
+            .and_then(|profile| env_profile_target_key(profile).ok())
+            .as_ref()
+            == Some(target_key)
+    });
+    active
+}
+
+fn env_profile_target_key(profile: &EnvProfileConfig) -> Result<String> {
+    let target_dir = profile
+        .target_dir
+        .as_ref()
+        .ok_or_else(|| AppError::msg("target directory is required"))?;
+    let target_key = target_dir.to_string_lossy().trim().to_string();
+    if target_key.is_empty() {
+        return Err(AppError::msg("target directory is required"));
+    }
+    Ok(target_key)
 }
 
 fn validate_name(label: &str, value: &str) -> Result<()> {
@@ -963,6 +1158,38 @@ fn env_for_tunnel(tunnel: &TunnelState) -> String {
     )
 }
 
+fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Result<String> {
+    let mut lines = vec![format!("# compose-tunnel env: {}", profile.name)];
+
+    for binding in &profile.tunnel_ports {
+        let tunnel = state
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == binding.tunnel_id)
+            .ok_or_else(|| AppError::msg(format!("tunnel {} was not found", binding.tunnel_id)))?;
+        if binding.alias.trim().is_empty() {
+            continue;
+        }
+        lines.push(format!("{}={}", binding.alias.trim(), tunnel.local_port));
+        if let Some(env_key) = binding.env_key.as_ref().map(|value| value.trim()) {
+            if !env_key.is_empty() {
+                lines.push(format!("{env_key}=${{{}}}", binding.alias.trim()));
+            }
+        }
+    }
+
+    for entry in &profile.extra_env {
+        let key = entry.key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        lines.push(format!("{key}={}", entry.value));
+    }
+
+    lines.push(String::new());
+    Ok(lines.join("\n"))
+}
+
 async fn write_managed_block(path: &Path, tunnel_id: &str, env: &str) -> Result<()> {
     let start = format!("# compose-tunnel:start {tunnel_id}");
     let end = format!("# compose-tunnel:end {tunnel_id}");
@@ -1116,5 +1343,77 @@ mod tests {
         let config: AppConfig = toml::from_str(raw).expect("config should parse");
 
         assert_eq!(config.servers[0].docker_command, "docker");
+    }
+
+    #[test]
+    fn env_profile_renders_tunnel_port_alias_and_extra_env() {
+        let profile = EnvProfileConfig {
+            name: "test".to_string(),
+            target_dir: Some(PathBuf::from("/tmp/app")),
+            tunnel_ports: vec![EnvTunnelPort {
+                tunnel_id: "db".to_string(),
+                alias: "server-db".to_string(),
+                env_key: Some("DATABASE_PORT".to_string()),
+            }],
+            extra_env: vec![EnvPlainEntry {
+                key: "DATABASE_HOST".to_string(),
+                value: "127.0.0.1".to_string(),
+            }],
+        };
+        let state = AppState {
+            tunnels: vec![TunnelState {
+                id: "db".to_string(),
+                server: "staging".to_string(),
+                project: "app".to_string(),
+                service: "db".to_string(),
+                network: "app_default".to_string(),
+                target_port: 5432,
+                socat_port: 5432,
+                local_host: "127.0.0.1".to_string(),
+                local_port: 15432,
+                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+                socat_container_ip: "172.18.0.20".to_string(),
+                ssh_pid: None,
+                status: TunnelStatus::Running,
+                mode: TunnelMode::SocatDirect,
+                env_prefix: None,
+                started_at: None,
+                last_error: None,
+            }],
+        };
+
+        let rendered = render_env_profile_inner(&profile, &state).expect("profile should render");
+
+        assert!(rendered.contains("server-db=15432"));
+        assert!(rendered.contains("DATABASE_PORT=${server-db}"));
+        assert!(rendered.contains("DATABASE_HOST=127.0.0.1"));
+    }
+
+    #[test]
+    fn active_env_profiles_are_scoped_by_target_directory() {
+        let config = AppConfig {
+            env_profiles: vec![
+                EnvProfileConfig {
+                    name: "app-test".to_string(),
+                    target_dir: Some(PathBuf::from("/tmp/app")),
+                    ..EnvProfileConfig::default()
+                },
+                EnvProfileConfig {
+                    name: "admin-prod".to_string(),
+                    target_dir: Some(PathBuf::from("/tmp/admin")),
+                    ..EnvProfileConfig::default()
+                },
+            ],
+            active_env_profiles: BTreeMap::from([
+                ("/tmp/app".to_string(), "app-test".to_string()),
+                ("/tmp/admin".to_string(), "admin-prod".to_string()),
+            ]),
+            ..AppConfig::default()
+        };
+
+        let active = active_env_profiles_for_config(&config);
+
+        assert_eq!(active.get("/tmp/app"), Some(&"app-test".to_string()));
+        assert_eq!(active.get("/tmp/admin"), Some(&"admin-prod".to_string()));
     }
 }

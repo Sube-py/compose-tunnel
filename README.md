@@ -14,7 +14,9 @@
 - Shared Rust core crate for config, state, SSH, Docker, tunnel lifecycle, cleanup, and env file blocks.
 - CLI binary named `compose-tunnel`.
 - Tauri 2 desktop app using the same Rust core.
-- Vue 3 UI for servers, Compose discovery, tunnel start/stop, env preview/write, logs, and settings.
+- Vue 3 UI for servers, Compose discovery, tunnel start/stop, env profiles, logs, and settings.
+- Env profiles in the desktop app can target a project directory, bind tunnel local ports to named variables, add extra env values, and write a managed block to that directory's `.env`.
+- Env activation is scoped by target directory, so each project can have one active env while other projects keep their own active env.
 - User config and state under the platform config directory via the `directories` crate.
 
 ## Run The CLI
@@ -39,12 +41,27 @@ pnpm install
 pnpm tauri dev
 ```
 
+## Env Profiles
+
+The desktop Env page is list-first. Use **Add Env** to open a PrimeVue dialog, choose a target project directory, add tunnel port bindings, and add extra env values.
+
+For a tunnel binding, the port variable name can be referenced by other env keys:
+
+```env
+staging-db=15432
+DATABASE_PORT=${staging-db}
+DATABASE_HOST=127.0.0.1
+```
+
+Click **Use Env** to make that profile active for its target directory. Only one env is active per target directory, but different project directories can activate different env profiles at the same time. **Write .env** writes or updates the compose-tunnel managed block in the selected directory's `.env`.
+
 ## Verify
 
 ```bash
 cargo check --workspace
 cargo test -p compose-tunnel-core
 pnpm build
+pnpm tauri build
 ```
 
 ## Notes

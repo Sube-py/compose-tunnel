@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useToast } from "primevue/usetoast";
 import Button from "primevue/button";
 import Card from "primevue/card";
 import Column from "primevue/column";
 import DataTable from "primevue/datatable";
+import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
 import InputText from "primevue/inputtext";
 import ScrollPanel from "primevue/scrollpanel";
@@ -67,6 +69,24 @@ type TunnelState = {
   last_error?: string | null;
 };
 
+type EnvTunnelPort = {
+  tunnel_id: string;
+  alias: string;
+  env_key?: string | null;
+};
+
+type EnvPlainEntry = {
+  key: string;
+  value: string;
+};
+
+type EnvProfileConfig = {
+  name: string;
+  target_dir?: string | null;
+  tunnel_ports: EnvTunnelPort[];
+  extra_env: EnvPlainEntry[];
+};
+
 const tabs = ["Dashboard", "Servers", "Compose", "Tunnels", "Env", "Logs", "Settings"] as const;
 type Tab = (typeof tabs)[number];
 
@@ -86,12 +106,21 @@ const servers = ref<ServerConfig[]>([]);
 const projects = ref<ComposeProject[]>([]);
 const services = ref<ComposeService[]>([]);
 const tunnels = ref<TunnelState[]>([]);
+const envProfiles = ref<EnvProfileConfig[]>([]);
+const activeEnvProfiles = ref<Record<string, string>>({});
 const selectedServer = ref("");
 const selectedProject = ref("");
-const selectedTunnel = ref("");
 const envPreview = ref("");
-const envPath = ref(".env.local");
 const editingServerName = ref("");
+const selectedEnvProfileName = ref("");
+const envDialogVisible = ref(false);
+const envBindingServer = ref("");
+const envBindingProject = ref("");
+const envBindingTunnelId = ref("");
+const envBindingAlias = ref("");
+const envBindingEnvKey = ref("");
+const extraEnvKey = ref("");
+const extraEnvValue = ref("");
 
 const serverForm = reactive<ServerConfig>({
   name: "",
@@ -115,6 +144,13 @@ const tunnelForm = reactive({
   socat_image: "",
 });
 
+const envProfileForm = reactive<EnvProfileConfig>({
+  name: "",
+  target_dir: "",
+  tunnel_ports: [],
+  extra_env: [],
+});
+
 const runningCount = computed(() => tunnels.value.filter((item) => item.status === "running").length);
 const stoppedCount = computed(() => tunnels.value.filter((item) => item.status !== "running").length);
 const dockerCommandPreset = computed(() => {
@@ -132,7 +168,27 @@ const dockerModeOptions = [
   { label: "custom", value: "custom" },
 ];
 const serverOptions = computed(() => servers.value.map((server) => ({ label: server.name, value: server.name })));
-const tunnelOptions = computed(() => tunnels.value.map((tunnel) => ({ label: tunnel.id, value: tunnel.id })));
+const envBindingServerOptions = computed(() =>
+  Array.from(new Set(tunnels.value.map((tunnel) => tunnel.server))).map((server) => ({ label: server, value: server })),
+);
+const envBindingProjectOptions = computed(() =>
+  Array.from(
+    new Set(
+      tunnels.value
+        .filter((tunnel) => !envBindingServer.value || tunnel.server === envBindingServer.value)
+        .map((tunnel) => tunnel.project),
+    ),
+  ).map((project) => ({ label: project, value: project })),
+);
+const envBindingTunnelOptions = computed(() =>
+  tunnels.value
+    .filter((tunnel) => !envBindingServer.value || tunnel.server === envBindingServer.value)
+    .filter((tunnel) => !envBindingProject.value || tunnel.project === envBindingProject.value)
+    .map((tunnel) => ({
+      label: `${tunnel.server}/${tunnel.project}/${tunnel.service}:${tunnel.target_port} (${tunnel.status}, ${tunnel.local_host}:${tunnel.local_port})`,
+      value: tunnel.id,
+    })),
+);
 const tunnelProjectOptions = computed(() =>
   projects.value.filter((project) => project.server === tunnelForm.server),
 );
@@ -179,6 +235,7 @@ async function bootstrap() {
     Object.assign(defaults, config.defaults);
     await refreshServers();
     await refreshTunnels();
+    await refreshEnvProfiles();
   });
 }
 
@@ -194,8 +251,13 @@ async function refreshServers() {
 
 async function refreshTunnels() {
   tunnels.value = await invoke<TunnelState[]>("list_tunnels");
-  if (!selectedTunnel.value && tunnels.value.length > 0) {
-    selectedTunnel.value = tunnels.value[0].id;
+}
+
+async function refreshEnvProfiles() {
+  envProfiles.value = await invoke<EnvProfileConfig[]>("list_env_profiles");
+  activeEnvProfiles.value = await invoke<Record<string, string>>("active_env_profiles");
+  if (selectedEnvProfileName.value && envProfiles.value.some((profile) => profile.name === selectedEnvProfileName.value)) {
+    loadEnvProfile(selectedEnvProfileName.value);
   }
 }
 
@@ -384,38 +446,220 @@ async function startTunnel(tunnel: TunnelState) {
   });
 }
 
-async function renderEnv() {
-  if (!selectedTunnel.value) {
-    toast.add({ severity: "warn", summary: "Select a tunnel first", life: 3000 });
+async function saveDefaultSettings() {
+  await runTask("Saved settings", async () => {
+    await invoke("save_defaults", { defaults: { ...defaults } });
+  });
+}
+
+function newEnvProfile() {
+  selectedEnvProfileName.value = "";
+  envPreview.value = "";
+  envBindingServer.value = "";
+  envBindingProject.value = "";
+  envBindingTunnelId.value = "";
+  envBindingAlias.value = "";
+  envBindingEnvKey.value = "";
+  extraEnvKey.value = "";
+  extraEnvValue.value = "";
+  Object.assign(envProfileForm, {
+    name: "",
+    target_dir: "",
+    tunnel_ports: [],
+    extra_env: [],
+  });
+}
+
+function openNewEnvDialog() {
+  newEnvProfile();
+  envDialogVisible.value = true;
+}
+
+function openEditEnvDialog(profile: EnvProfileConfig) {
+  loadEnvProfile(profile.name);
+  envDialogVisible.value = true;
+}
+
+function loadEnvProfile(name: string) {
+  const profile = envProfiles.value.find((item) => item.name === name);
+  if (!profile) {
+    newEnvProfile();
     return;
   }
-  const result = await runTask(`Rendered env for ${selectedTunnel.value}`, async () =>
-    invoke<string>("render_env", { tunnelId: selectedTunnel.value }),
+  selectedEnvProfileName.value = profile.name;
+  envPreview.value = "";
+  Object.assign(envProfileForm, {
+    name: profile.name,
+    target_dir: profile.target_dir ?? "",
+    tunnel_ports: profile.tunnel_ports.map((item) => ({ ...item })),
+    extra_env: profile.extra_env.map((item) => ({ ...item })),
+  });
+}
+
+function compactEnvProfile(): EnvProfileConfig {
+  return {
+    name: envProfileForm.name.trim(),
+    target_dir: optional(envProfileForm.target_dir),
+    tunnel_ports: envProfileForm.tunnel_ports
+      .filter((item) => item.tunnel_id.trim() && item.alias.trim())
+      .map((item) => ({
+        tunnel_id: item.tunnel_id.trim(),
+        alias: item.alias.trim(),
+        env_key: optional(item.env_key),
+      })),
+    extra_env: envProfileForm.extra_env
+      .filter((item) => item.key.trim())
+      .map((item) => ({ key: item.key.trim(), value: item.value })),
+  };
+}
+
+async function saveEnvProfile(showToast = true, closeDialog = false) {
+  if (!envProfileForm.name.trim()) {
+    toast.add({ severity: "warn", summary: "Env name is required", life: 3000 });
+    return false;
+  }
+  const profile = compactEnvProfile();
+  const result = await runTask(
+    `Saved env ${profile.name}`,
+    async () => {
+      await invoke("save_env_profile", { profile });
+      await refreshEnvProfiles();
+      selectedEnvProfileName.value = profile.name;
+      loadEnvProfile(profile.name);
+      if (closeDialog) {
+        envDialogVisible.value = false;
+      }
+    },
+    showToast,
+  );
+  return result !== null;
+}
+
+async function deleteEnvProfile(profile?: EnvProfileConfig) {
+  const name = profile?.name ?? selectedEnvProfileName.value;
+  if (!name) {
+    toast.add({ severity: "warn", summary: "Select an env first", life: 3000 });
+    return;
+  }
+  await runTask(`Deleted env ${name}`, async () => {
+    await invoke("delete_env_profile", { name });
+    if (selectedEnvProfileName.value === name) {
+      newEnvProfile();
+      envDialogVisible.value = false;
+    }
+    await refreshEnvProfiles();
+  });
+}
+
+async function activateEnvProfile(profile?: EnvProfileConfig) {
+  let name = profile?.name ?? envProfileForm.name.trim();
+  if (!profile) {
+    const saved = await saveEnvProfile(false);
+    if (!saved) {
+      return;
+    }
+    name = envProfileForm.name.trim();
+  }
+  await runTask(`Activated env ${name}`, async () => {
+    await invoke("set_active_env_profile", { name });
+    await refreshEnvProfiles();
+  });
+}
+
+async function chooseEnvDirectory() {
+  const selected = await open({ directory: true, multiple: false });
+  if (typeof selected === "string") {
+    envProfileForm.target_dir = selected;
+  }
+}
+
+function defaultPortAlias(tunnel: TunnelState) {
+  return `${tunnel.server}-${tunnel.service}`.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function portReference(alias: string) {
+  return `\${${alias}}`;
+}
+
+function addEnvTunnelPort() {
+  const tunnel = tunnels.value.find((item) => item.id === envBindingTunnelId.value);
+  if (!tunnel) {
+    toast.add({ severity: "warn", summary: "Select a tunnel", life: 3000 });
+    return;
+  }
+  const alias = (envBindingAlias.value || defaultPortAlias(tunnel)).trim();
+  envProfileForm.tunnel_ports.push({
+    tunnel_id: tunnel.id,
+    alias,
+    env_key: optional(envBindingEnvKey.value),
+  });
+  envBindingTunnelId.value = "";
+  envBindingAlias.value = "";
+  envBindingEnvKey.value = "";
+}
+
+function removeEnvTunnelPort(index: number) {
+  envProfileForm.tunnel_ports.splice(index, 1);
+}
+
+function addExtraEnv() {
+  if (!extraEnvKey.value.trim()) {
+    toast.add({ severity: "warn", summary: "Env key is required", life: 3000 });
+    return;
+  }
+  envProfileForm.extra_env.push({ key: extraEnvKey.value.trim(), value: extraEnvValue.value });
+  extraEnvKey.value = "";
+  extraEnvValue.value = "";
+}
+
+function removeExtraEnv(index: number) {
+  envProfileForm.extra_env.splice(index, 1);
+}
+
+async function renderEnvProfilePreview(profile?: EnvProfileConfig) {
+  let name = profile?.name ?? envProfileForm.name.trim();
+  if (!profile) {
+    const saved = await saveEnvProfile(false);
+    if (!saved) {
+      return;
+    }
+    name = envProfileForm.name.trim();
+  }
+  const result = await runTask(`Rendered env ${name}`, async () =>
+    invoke<string>("render_env_profile", { name }),
   );
   if (result !== null) {
     envPreview.value = result;
   }
 }
 
-async function writeEnv() {
-  if (!selectedTunnel.value) {
-    toast.add({ severity: "warn", summary: "Select a tunnel first", life: 3000 });
-    return;
+async function writeActiveEnvProfile(profile?: EnvProfileConfig) {
+  let name = profile?.name ?? envProfileForm.name.trim();
+  if (!profile) {
+    const saved = await saveEnvProfile(false);
+    if (!saved) {
+      return;
+    }
+    name = envProfileForm.name.trim();
   }
-  await runTask(`Wrote env block to ${envPath.value}`, async () => {
-    await invoke("write_env_file", {
-      request: {
-        tunnel_id: selectedTunnel.value,
-        path: envPath.value,
-      },
+  await runTask(`Wrote ${name} .env`, async () => {
+    await invoke("set_active_env_profile", { name });
+    const path = await invoke<string>("write_env_profile", {
+      request: { name },
     });
-  });
+    await refreshEnvProfiles();
+    envPreview.value = await invoke<string>("render_env_profile", { name });
+    toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
+  }, false);
 }
 
-async function saveDefaultSettings() {
-  await runTask("Saved settings", async () => {
-    await invoke("save_defaults", { defaults: { ...defaults } });
-  });
+function envTargetKey(profile: EnvProfileConfig) {
+  return profile.target_dir?.trim() ?? "";
+}
+
+function isActiveEnvProfile(profile: EnvProfileConfig) {
+  const key = envTargetKey(profile);
+  return Boolean(key) && activeEnvProfiles.value[key] === profile.name;
 }
 
 function clearServerForm() {
@@ -657,13 +901,134 @@ onMounted(bootstrap);
       </section>
 
       <section v-if="activeTab === 'Env'" class="page">
-        <div class="toolbar">
-          <Select v-model="selectedTunnel" :options="tunnelOptions" optionLabel="label" optionValue="value" placeholder="Select tunnel" />
-          <Button label="Preview" icon="pi pi-eye" outlined @click="renderEnv" />
-          <InputText v-model="envPath" />
-          <Button label="Write" icon="pi pi-file-export" @click="writeEnv" />
+        <div class="panel">
+          <div class="row-between">
+            <h3>Env Profiles</h3>
+            <Button label="Add Env" icon="pi pi-plus" @click="openNewEnvDialog" />
+          </div>
+          <DataTable :value="envProfiles" size="small" stripedRows>
+            <Column field="name" header="Name" />
+            <Column header="Target directory">
+              <template #body="{ data }">
+                <span class="breakable">{{ data.target_dir || "not set" }}</span>
+              </template>
+            </Column>
+            <Column header="Active">
+              <template #body="{ data }">
+                <Tag v-if="isActiveEnvProfile(data)" value="active" severity="success" />
+                <Tag v-else value="inactive" severity="secondary" />
+              </template>
+            </Column>
+            <Column header="Tunnel ports">
+              <template #body="{ data }">{{ data.tunnel_ports.length }}</template>
+            </Column>
+            <Column header="Extra env">
+              <template #body="{ data }">{{ data.extra_env.length }}</template>
+            </Column>
+            <Column header="Actions">
+              <template #body="{ data }">
+                <div class="actions">
+                  <Button icon="pi pi-pencil" label="Edit" size="small" text @click="openEditEnvDialog(data)" />
+                  <Button icon="pi pi-check-circle" label="Use Env" size="small" severity="success" text @click="activateEnvProfile(data)" />
+                  <Button icon="pi pi-eye" label="Preview" size="small" text @click="renderEnvProfilePreview(data)" />
+                  <Button icon="pi pi-file-export" label="Write .env" size="small" text @click="writeActiveEnvProfile(data)" />
+                  <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteEnvProfile(data)" />
+                </div>
+              </template>
+            </Column>
+          </DataTable>
         </div>
-        <pre>{{ envPreview }}</pre>
+
+        <div v-if="envPreview" class="panel">
+          <div class="row-between">
+            <h3>.env Preview</h3>
+            <Button label="Clear" icon="pi pi-times" size="small" severity="secondary" outlined @click="envPreview = ''" />
+          </div>
+          <pre>{{ envPreview }}</pre>
+        </div>
+
+        <Dialog v-model:visible="envDialogVisible" modal :header="selectedEnvProfileName ? `Edit ${selectedEnvProfileName}` : 'Add Env'" class="env-dialog">
+          <div class="dialog-stack form">
+            <div class="env-profile-grid">
+              <label>Env name<InputText v-model="envProfileForm.name" placeholder="test" /></label>
+              <label>
+                Target directory
+                <div class="inline-field">
+                  <InputText v-model="envProfileForm.target_dir" placeholder="/path/to/app" />
+                  <Button label="Choose" icon="pi pi-folder-open" outlined @click="chooseEnvDirectory" />
+                </div>
+              </label>
+            </div>
+
+            <div class="panel nested-panel">
+              <h3>Tunnel Port Bindings</h3>
+              <div class="env-profile-grid">
+                <label>
+                  Server
+                  <Select v-model="envBindingServer" :options="envBindingServerOptions" optionLabel="label" optionValue="value" placeholder="Any server" />
+                </label>
+                <label>
+                  Compose project
+                  <Select v-model="envBindingProject" :options="envBindingProjectOptions" optionLabel="label" optionValue="value" placeholder="Any project" />
+                </label>
+                <label>
+                  Tunnel
+                  <Select v-model="envBindingTunnelId" :options="envBindingTunnelOptions" optionLabel="label" optionValue="value" placeholder="Select tunnel" />
+                </label>
+                <label>Port variable name<InputText v-model="envBindingAlias" placeholder="server_name-container_name" /></label>
+                <label>Env key using port<InputText v-model="envBindingEnvKey" placeholder="DATABASE_PORT" /></label>
+              </div>
+              <div class="toolbar">
+                <Button label="Add Tunnel Port" icon="pi pi-plus" outlined @click="addEnvTunnelPort" />
+              </div>
+              <DataTable :value="envProfileForm.tunnel_ports" size="small" stripedRows>
+                <Column field="tunnel_id" header="Tunnel" />
+                <Column field="alias" header="Port variable" />
+                <Column header="Env key">
+                  <template #body="{ data }">{{ data.env_key || "" }}</template>
+                </Column>
+                <Column header="Output">
+                  <template #body="{ data }">
+                    <code v-if="data.env_key">{{ data.env_key }}={{ portReference(data.alias) }}</code>
+                    <code v-else>{{ data.alias }}=&lt;local-port&gt;</code>
+                  </template>
+                </Column>
+                <Column header="">
+                  <template #body="{ index }">
+                    <Button icon="pi pi-trash" label="Remove" size="small" severity="danger" text @click="removeEnvTunnelPort(index)" />
+                  </template>
+                </Column>
+              </DataTable>
+            </div>
+
+            <div class="panel nested-panel">
+              <h3>Extra Env</h3>
+              <div class="env-profile-grid">
+                <label>Key<InputText v-model="extraEnvKey" placeholder="DATABASE_HOST" /></label>
+                <label>Value<InputText v-model="extraEnvValue" placeholder="127.0.0.1" /></label>
+              </div>
+              <div class="toolbar">
+                <Button label="Add Env" icon="pi pi-plus" outlined @click="addExtraEnv" />
+              </div>
+              <DataTable :value="envProfileForm.extra_env" size="small" stripedRows>
+                <Column field="key" header="Key" />
+                <Column field="value" header="Value" />
+                <Column header="">
+                  <template #body="{ index }">
+                    <Button icon="pi pi-trash" label="Remove" size="small" severity="danger" text @click="removeExtraEnv(index)" />
+                  </template>
+                </Column>
+              </DataTable>
+            </div>
+
+            <div class="toolbar">
+              <Button label="Preview" icon="pi pi-eye" outlined @click="renderEnvProfilePreview()" />
+              <Button label="Use Env" icon="pi pi-check-circle" severity="success" outlined @click="activateEnvProfile()" />
+              <Button label="Write .env" icon="pi pi-file-export" outlined @click="writeActiveEnvProfile()" />
+              <Button label="Save" icon="pi pi-save" @click="saveEnvProfile(true, true)" />
+            </div>
+          </div>
+        </Dialog>
       </section>
 
       <section v-if="activeTab === 'Logs'" class="page">
