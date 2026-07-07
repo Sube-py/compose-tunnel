@@ -293,6 +293,26 @@ async function saveServer() {
 }
 
 async function deleteServer(name: string) {
+  confirm.require({
+    header: "Delete server",
+    message: `Delete server ${name}? Existing tunnels and env profiles that reference this server will no longer be usable until updated.`,
+    icon: "pi pi-exclamation-triangle",
+    rejectProps: {
+      label: "Cancel",
+      severity: "secondary",
+      outlined: true,
+    },
+    acceptProps: {
+      label: "Delete",
+      severity: "danger",
+    },
+    accept: () => {
+      void runDeleteServer(name);
+    },
+  });
+}
+
+async function runDeleteServer(name: string) {
   await runTask(`Deleted server ${name}`, async () => {
     await invoke("delete_server", { name });
     await refreshServers();
