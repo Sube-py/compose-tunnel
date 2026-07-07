@@ -1213,10 +1213,12 @@ fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Res
         if binding.alias.trim().is_empty() {
             continue;
         }
-        lines.push(format!("{}={}", binding.alias.trim(), tunnel.local_port));
+        let alias = normalize_env_name(&binding.alias);
+        lines.push(format!("{alias}={}", tunnel.local_port));
         if let Some(env_key) = binding.env_key.as_ref().map(|value| value.trim()) {
             if !env_key.is_empty() {
-                lines.push(format!("{env_key}=${{{}}}", binding.alias.trim()));
+                let env_key = normalize_env_name(env_key);
+                lines.push(format!("{env_key}=${{{alias}}}"));
             }
         }
     }
@@ -1226,6 +1228,7 @@ fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Res
         if key.is_empty() {
             continue;
         }
+        let key = normalize_env_name(key);
         lines.push(format!("{key}={}", entry.value));
     }
 
@@ -1500,11 +1503,11 @@ mod tests {
             target_dir: Some(PathBuf::from("/tmp/app")),
             tunnel_ports: vec![EnvTunnelPort {
                 tunnel_id: "db".to_string(),
-                alias: "server_db".to_string(),
-                env_key: Some("DATABASE_PORT".to_string()),
+                alias: "server-db".to_string(),
+                env_key: Some("DATABASE-PORT".to_string()),
             }],
             extra_env: vec![EnvPlainEntry {
-                key: "DATABASE_HOST".to_string(),
+                key: "DATABASE-HOST".to_string(),
                 value: "127.0.0.1".to_string(),
             }],
         };
