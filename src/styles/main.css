@@ -312,9 +312,22 @@ nav {
   width: min(960px, calc(100vw - 32px));
 }
 
+.env-dialog .p-dialog-content {
+  max-height: min(760px, calc(100vh - 150px));
+  overflow-y: auto;
+}
+
 .dialog-stack {
   display: grid;
   gap: 16px;
+}
+
+.dialog-stack > .toolbar:last-child {
+  position: sticky;
+  bottom: -1px;
+  z-index: 1;
+  padding-top: 12px;
+  background: #ffffff;
 }
 
 .nested-panel {
