@@ -486,6 +486,12 @@ fn normalize_env_profile(mut profile: EnvProfileConfig) -> Result<EnvProfileConf
             )));
         }
     }
+    let mut seen_extra_keys = BTreeSet::new();
+    profile.extra_env.reverse();
+    profile
+        .extra_env
+        .retain(|entry| seen_extra_keys.insert(entry.key.clone()));
+    profile.extra_env.reverse();
     Ok(profile)
 }
 
@@ -2054,5 +2060,30 @@ mod tests {
             error.to_string(),
             "env value for DATABASE_PASSWORD may not contain newlines"
         );
+    }
+
+    #[test]
+    fn env_profile_extra_env_deduplicates_normalized_keys() {
+        let profile = EnvProfileConfig {
+            name: "test".to_string(),
+            target_dir: Some(PathBuf::from("/tmp/app")),
+            extra_env: vec![
+                EnvPlainEntry {
+                    key: "DATABASE-HOST".to_string(),
+                    value: "old.example.com".to_string(),
+                },
+                EnvPlainEntry {
+                    key: "DATABASE_HOST".to_string(),
+                    value: "new.example.com".to_string(),
+                },
+            ],
+            ..EnvProfileConfig::default()
+        };
+
+        let profile = normalize_env_profile(profile).expect("profile should normalize");
+
+        assert_eq!(profile.extra_env.len(), 1);
+        assert_eq!(profile.extra_env[0].key, "DATABASE_HOST");
+        assert_eq!(profile.extra_env[0].value, "new.example.com");
     }
 }
