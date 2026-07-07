@@ -839,7 +839,7 @@ async function writeActiveEnvProfile(profile?: EnvProfileConfig) {
   if (sensitiveKeys.length > 0) {
     confirm.require({
       header: "Write sensitive env values",
-      message: `Write ${sensitiveKeys.join(", ")} to this project's .env file?`,
+      message: `Write ${formatSensitiveEnvKeys(sensitiveKeys)} to this project's .env file?`,
       icon: "pi pi-exclamation-triangle",
       rejectProps: {
         label: "Cancel",
@@ -872,9 +872,19 @@ async function runWriteActiveEnvProfile(name: string) {
 }
 
 function sensitiveEnvKeys(profile: EnvProfileConfig) {
-  return profile.extra_env
-    .map((entry) => entry.key.trim())
-    .filter((key) => /password|token|secret|private[_-]?key/i.test(key));
+  return Array.from(
+    new Set(
+      profile.extra_env
+        .map((entry) => entry.key.trim())
+        .filter((key) => /password|token|secret|private[_-]?key/i.test(key)),
+    ),
+  );
+}
+
+function formatSensitiveEnvKeys(keys: string[]) {
+  const visible = keys.slice(0, 5).join(", ");
+  const hiddenCount = keys.length - 5;
+  return hiddenCount > 0 ? `${visible}, and ${hiddenCount} more` : visible;
 }
 
 function envTargetKey(profile: EnvProfileConfig) {
