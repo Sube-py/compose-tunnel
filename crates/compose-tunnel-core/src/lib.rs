@@ -411,7 +411,7 @@ pub async fn save_defaults(defaults: Defaults) -> Result<()> {
 }
 
 pub async fn list_env_profiles() -> Result<Vec<EnvProfileConfig>> {
-    Ok(load_config().await?.env_profiles)
+    Ok(env_profiles_for_display(&load_config().await?))
 }
 
 pub async fn active_env_profile() -> Result<Option<String>> {
@@ -970,6 +970,20 @@ fn active_env_profiles_for_config(config: &AppConfig) -> BTreeMap<String, String
             == Some(target_key)
     });
     active
+}
+
+fn env_profiles_for_display(config: &AppConfig) -> Vec<EnvProfileConfig> {
+    config
+        .env_profiles
+        .iter()
+        .cloned()
+        .map(|mut profile| {
+            if let Ok(target_dir) = env_profile_target_dir(&profile) {
+                profile.target_dir = Some(target_dir);
+            }
+            profile
+        })
+        .collect()
 }
 
 fn env_profile_target_key(profile: &EnvProfileConfig) -> Result<String> {
@@ -1935,6 +1949,27 @@ mod tests {
 
         assert_eq!(active.get("/tmp/app"), Some(&"app-test".to_string()));
         assert_eq!(active.get("/tmp/admin"), Some(&"admin-prod".to_string()));
+    }
+
+    #[test]
+    fn env_profiles_for_display_normalizes_target_directories() {
+        let config = AppConfig {
+            env_profiles: vec![EnvProfileConfig {
+                name: "app-test".to_string(),
+                target_dir: Some(PathBuf::from("relative-app")),
+                ..EnvProfileConfig::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        let profiles = env_profiles_for_display(&config);
+        let target_dir = profiles[0]
+            .target_dir
+            .as_ref()
+            .expect("target dir should be present");
+
+        assert!(target_dir.is_absolute());
+        assert!(target_dir.ends_with("relative-app"));
     }
 
     #[test]
