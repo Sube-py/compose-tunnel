@@ -477,6 +477,12 @@ fn normalize_env_profile(mut profile: EnvProfileConfig) -> Result<EnvProfileConf
             .as_ref()
             .map(|value| normalize_env_name(value));
     }
+    let mut seen_tunnel_aliases = BTreeSet::new();
+    profile.tunnel_ports.reverse();
+    profile
+        .tunnel_ports
+        .retain(|binding| seen_tunnel_aliases.insert(binding.alias.clone()));
+    profile.tunnel_ports.reverse();
     for entry in &mut profile.extra_env {
         entry.key = normalize_env_name(&entry.key);
         if entry.value.contains('\n') || entry.value.contains('\r') {
@@ -2085,5 +2091,33 @@ mod tests {
         assert_eq!(profile.extra_env.len(), 1);
         assert_eq!(profile.extra_env[0].key, "DATABASE_HOST");
         assert_eq!(profile.extra_env[0].value, "new.example.com");
+    }
+
+    #[test]
+    fn env_profile_tunnel_ports_deduplicate_normalized_aliases() {
+        let profile = EnvProfileConfig {
+            name: "test".to_string(),
+            target_dir: Some(PathBuf::from("/tmp/app")),
+            tunnel_ports: vec![
+                EnvTunnelPort {
+                    tunnel_id: "db".to_string(),
+                    alias: "server-db".to_string(),
+                    env_key: Some("OLD_PORT".to_string()),
+                },
+                EnvTunnelPort {
+                    tunnel_id: "redis".to_string(),
+                    alias: "server_db".to_string(),
+                    env_key: Some("NEW-PORT".to_string()),
+                },
+            ],
+            ..EnvProfileConfig::default()
+        };
+
+        let profile = normalize_env_profile(profile).expect("profile should normalize");
+
+        assert_eq!(profile.tunnel_ports.len(), 1);
+        assert_eq!(profile.tunnel_ports[0].tunnel_id, "redis");
+        assert_eq!(profile.tunnel_ports[0].alias, "server_db");
+        assert_eq!(profile.tunnel_ports[0].env_key.as_deref(), Some("NEW_PORT"));
     }
 }
