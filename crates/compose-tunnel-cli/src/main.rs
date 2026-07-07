@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use compose_tunnel_core::{
-    active_env_profiles, cleanup, close_all_tunnels, close_tunnel, delete_server, init_config,
-    list_compose_projects, list_compose_services, list_env_profiles, list_servers, list_tunnels,
-    open_tunnel, render_env, render_env_profile, save_env_profile, save_server,
-    set_active_env_profile, test_server, write_env_file, write_env_profile, EnvPlainEntry,
-    EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest, ServerConfig, WriteEnvFileRequest,
-    WriteEnvProfileRequest,
+    active_env_profiles, cleanup, close_all_tunnels, close_tunnel, delete_env_profile,
+    delete_server, init_config, list_compose_projects, list_compose_services, list_env_profiles,
+    list_servers, list_tunnels, open_tunnel, render_env, render_env_profile, save_env_profile,
+    save_server, set_active_env_profile, test_server, write_env_file, write_env_profile,
+    EnvPlainEntry, EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest, ServerConfig,
+    WriteEnvFileRequest, WriteEnvProfileRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -135,6 +135,7 @@ enum EnvProfileCommand {
     Show { name: String },
     Use { name: String },
     Write { name: String },
+    Delete { name: String },
 }
 
 #[derive(Debug, Args)]
@@ -314,6 +315,10 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
             set_active_env_profile(name.clone()).await?;
             let path = write_env_profile(WriteEnvProfileRequest { name: name.clone() }).await?;
             println!("Wrote env profile {name} to {}", path.display());
+        }
+        EnvProfileCommand::Delete { name } => {
+            delete_env_profile(name.clone()).await?;
+            println!("Deleted env profile {name}");
         }
     }
     Ok(())
