@@ -944,7 +944,19 @@ fn find_env_profile<'a>(config: &'a AppConfig, name: &str) -> Result<&'a EnvProf
 }
 
 fn active_env_profiles_for_config(config: &AppConfig) -> BTreeMap<String, String> {
-    let mut active = config.active_env_profiles.clone();
+    let mut active = BTreeMap::new();
+
+    for active_name in config.active_env_profiles.values() {
+        if let Some(profile) = config
+            .env_profiles
+            .iter()
+            .find(|profile| &profile.name == active_name)
+        {
+            if let Ok(target_key) = env_profile_target_key(profile) {
+                active.insert(target_key, active_name.clone());
+            }
+        }
+    }
 
     if let Some(legacy_name) = &config.active_env_profile {
         if active.values().all(|name| name != legacy_name) {
@@ -959,16 +971,6 @@ fn active_env_profiles_for_config(config: &AppConfig) -> BTreeMap<String, String
             }
         }
     }
-
-    active.retain(|target_key, active_name| {
-        config
-            .env_profiles
-            .iter()
-            .find(|profile| &profile.name == active_name)
-            .and_then(|profile| env_profile_target_key(profile).ok())
-            .as_ref()
-            == Some(target_key)
-    });
     active
 }
 
@@ -1949,6 +1951,31 @@ mod tests {
 
         assert_eq!(active.get("/tmp/app"), Some(&"app-test".to_string()));
         assert_eq!(active.get("/tmp/admin"), Some(&"admin-prod".to_string()));
+    }
+
+    #[test]
+    fn active_env_profiles_normalize_stored_target_keys() {
+        let config = AppConfig {
+            env_profiles: vec![EnvProfileConfig {
+                name: "app-test".to_string(),
+                target_dir: Some(PathBuf::from("relative-app")),
+                ..EnvProfileConfig::default()
+            }],
+            active_env_profiles: BTreeMap::from([(
+                "relative-app".to_string(),
+                "app-test".to_string(),
+            )]),
+            ..AppConfig::default()
+        };
+
+        let active = active_env_profiles_for_config(&config);
+        let normalized_key = active
+            .keys()
+            .next()
+            .expect("active profile should be preserved");
+
+        assert!(normalized_key.ends_with("relative-app"));
+        assert_eq!(active.get(normalized_key), Some(&"app-test".to_string()));
     }
 
     #[test]
