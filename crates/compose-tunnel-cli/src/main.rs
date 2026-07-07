@@ -434,3 +434,49 @@ fn ok_text(value: bool) -> &'static str {
         "failed"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tunnel_port_binding_with_env_key() {
+        let binding =
+            parse_env_tunnel_port("db:staging_db:DATABASE_PORT").expect("binding should parse");
+
+        assert_eq!(binding.tunnel_id, "db");
+        assert_eq!(binding.alias, "staging_db");
+        assert_eq!(binding.env_key.as_deref(), Some("DATABASE_PORT"));
+    }
+
+    #[test]
+    fn parses_tunnel_port_binding_without_env_key() {
+        let binding = parse_env_tunnel_port("redis:staging_redis").expect("binding should parse");
+
+        assert_eq!(binding.tunnel_id, "redis");
+        assert_eq!(binding.alias, "staging_redis");
+        assert_eq!(binding.env_key, None);
+    }
+
+    #[test]
+    fn rejects_invalid_tunnel_port_binding() {
+        assert!(parse_env_tunnel_port("db").is_err());
+        assert!(parse_env_tunnel_port(":alias").is_err());
+        assert!(parse_env_tunnel_port("db:").is_err());
+    }
+
+    #[test]
+    fn parses_plain_env_and_keeps_equals_in_value() {
+        let entry = parse_plain_env("DATABASE_URL=postgres://u:p@localhost/db?sslmode=disable")
+            .expect("env should parse");
+
+        assert_eq!(entry.key, "DATABASE_URL");
+        assert_eq!(entry.value, "postgres://u:p@localhost/db?sslmode=disable");
+    }
+
+    #[test]
+    fn rejects_plain_env_without_key_or_separator() {
+        assert!(parse_plain_env("DATABASE_URL").is_err());
+        assert!(parse_plain_env("=value").is_err());
+    }
+}
