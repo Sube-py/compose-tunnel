@@ -466,6 +466,26 @@ async function closeTunnel(id: string) {
 }
 
 async function stopAllTunnels() {
+  confirm.require({
+    header: "Stop all tunnels",
+    message: `Stop ${runningCount.value} running tunnel(s) and remove their remote socat containers?`,
+    icon: "pi pi-exclamation-triangle",
+    rejectProps: {
+      label: "Cancel",
+      severity: "secondary",
+      outlined: true,
+    },
+    acceptProps: {
+      label: "Stop All",
+      severity: "danger",
+    },
+    accept: () => {
+      void runStopAllTunnels();
+    },
+  });
+}
+
+async function runStopAllTunnels() {
   await runTask("Stopped all tunnels", async () => {
     await invoke("close_all_tunnels");
     await refreshTunnels();
