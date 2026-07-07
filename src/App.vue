@@ -429,21 +429,33 @@ async function closeTunnel(id: string) {
 
 async function startTunnel(tunnel: TunnelState) {
   await runTask(`Started tunnel ${tunnel.id}`, async () => {
-    await invoke("open_tunnel", {
-      request: {
-        server: tunnel.server,
-        project: tunnel.project,
-        service: tunnel.service,
-        target_port: tunnel.target_port,
-        network: tunnel.network,
-        local_port: null,
-        local_host: tunnel.local_host || defaults.local_host,
-        socat_port: tunnel.socat_port,
-        socat_image: null,
-        env_prefix: tunnel.env_prefix,
-      },
-    });
+    await openTunnelFromState(tunnel, null);
     await refreshTunnels();
+  });
+}
+
+async function restartTunnel(tunnel: TunnelState) {
+  await runTask(`Restarted tunnel ${tunnel.id}`, async () => {
+    await invoke("close_tunnel", { tunnelId: tunnel.id });
+    await openTunnelFromState(tunnel, tunnel.local_port);
+    await refreshTunnels();
+  });
+}
+
+async function openTunnelFromState(tunnel: TunnelState, localPort: number | null) {
+  await invoke("open_tunnel", {
+    request: {
+      server: tunnel.server,
+      project: tunnel.project,
+      service: tunnel.service,
+      target_port: tunnel.target_port,
+      network: tunnel.network,
+      local_port: localPort,
+      local_host: tunnel.local_host || defaults.local_host,
+      socat_port: tunnel.socat_port,
+      socat_image: null,
+      env_prefix: tunnel.env_prefix,
+    },
   });
 }
 
@@ -943,6 +955,14 @@ onMounted(bootstrap);
               <template #body="{ data }">
                 <div class="actions">
                   <Button icon="pi pi-copy" label="Copy env" size="small" text @click="copyTunnelEnv(data)" />
+                  <Button
+                    v-if="data.status === 'running'"
+                    icon="pi pi-refresh"
+                    label="Restart"
+                    size="small"
+                    text
+                    @click="restartTunnel(data)"
+                  />
                   <Button
                     v-if="data.status === 'running'"
                     label="Stop"
