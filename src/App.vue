@@ -2,10 +2,12 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { useConfirm } from "primevue/useconfirm";
 import { useToast } from "primevue/usetoast";
 import Button from "primevue/button";
 import Card from "primevue/card";
 import Column from "primevue/column";
+import ConfirmDialog from "primevue/confirmdialog";
 import DataTable from "primevue/datatable";
 import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
@@ -96,6 +98,7 @@ const tabs = ["Dashboard", "Servers", "Compose", "Tunnels", "Env", "Logs", "Sett
 type Tab = (typeof tabs)[number];
 
 const toast = useToast();
+const confirm = useConfirm();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
 const logs = ref<string[]>([]);
@@ -454,6 +457,41 @@ async function cleanupSelectedServer() {
     toast.add({ severity: "warn", summary: "Select a server first", life: 3000 });
     return;
   }
+  const preview = await runTask(
+    `Previewed cleanup ${selectedServer.value}`,
+    async () => invoke<CleanupResult>("preview_cleanup", { serverId: selectedServer.value }),
+    false,
+  );
+  if (!preview) {
+    return;
+  }
+  if (preview.containers.length === 0) {
+    toast.add({ severity: "info", summary: "Nothing to clean up", detail: `No containers found on ${preview.server}`, life: 3200 });
+    return;
+  }
+
+  const containerList = preview.containers.slice(0, 5).join(", ");
+  const extraCount = preview.containers.length > 5 ? ` and ${preview.containers.length - 5} more` : "";
+  confirm.require({
+    header: "Cleanup remote containers",
+    message: `Remove ${preview.containers.length} compose-tunnel container(s) from ${preview.server}: ${containerList}${extraCount}?`,
+    icon: "pi pi-exclamation-triangle",
+    rejectProps: {
+      label: "Cancel",
+      severity: "secondary",
+      outlined: true,
+    },
+    acceptProps: {
+      label: "Cleanup",
+      severity: "danger",
+    },
+    accept: () => {
+      void runCleanupSelectedServer();
+    },
+  });
+}
+
+async function runCleanupSelectedServer() {
   const result = await runTask(
     `Cleaned up ${selectedServer.value}`,
     async () => invoke<CleanupResult>("cleanup", { serverId: selectedServer.value }),
@@ -858,6 +896,7 @@ onMounted(bootstrap);
 <template>
   <main class="shell">
     <Toast position="top-right" />
+    <ConfirmDialog />
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark">CT</span>

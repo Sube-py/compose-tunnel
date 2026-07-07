@@ -824,18 +824,7 @@ pub async fn close_all_tunnels() -> Result<()> {
 }
 
 pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
-    let config = load_config().await?;
-    let server = find_server(&config, &server_id)?;
-    let list_command = managed_container_list_command(&docker_command(server));
-    let output = run_ssh(&config.defaults, server, &list_command).await?;
-    let containers: Vec<String> = output
-        .lines()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    let state = load_refreshed_state().await?;
-    let containers = cleanup_candidates(containers, &state, &server_id);
+    let (config, server, containers) = cleanup_container_candidates(&server_id).await?;
 
     if !containers.is_empty() {
         let joined = containers
@@ -843,14 +832,41 @@ pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
             .map(|container| shell_quote(container))
             .collect::<Vec<_>>()
             .join(" ");
-        let command = format!("{} rm -f {joined}", docker_command(server));
-        run_ssh(&config.defaults, server, &command).await?;
+        let command = format!("{} rm -f {joined}", docker_command(&server));
+        run_ssh(&config.defaults, &server, &command).await?;
     }
 
     Ok(CleanupResult {
         server: server_id,
         containers,
     })
+}
+
+pub async fn preview_cleanup(server_id: String) -> Result<CleanupResult> {
+    let (_, _, containers) = cleanup_container_candidates(&server_id).await?;
+
+    Ok(CleanupResult {
+        server: server_id,
+        containers,
+    })
+}
+
+async fn cleanup_container_candidates(
+    server_id: &str,
+) -> Result<(AppConfig, ServerConfig, Vec<String>)> {
+    let config = load_config().await?;
+    let server = find_server(&config, server_id)?.clone();
+    let list_command = managed_container_list_command(&docker_command(&server));
+    let output = run_ssh(&config.defaults, &server, &list_command).await?;
+    let containers: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let state = load_refreshed_state().await?;
+    let containers = cleanup_candidates(containers, &state, server_id);
+    Ok((config, server, containers))
 }
 
 fn managed_container_list_command(docker: &str) -> String {

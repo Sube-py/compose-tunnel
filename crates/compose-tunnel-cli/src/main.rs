@@ -4,10 +4,10 @@ use clap::{Args, Parser, Subcommand};
 use compose_tunnel_core::{
     active_env_profiles, cleanup, close_all_tunnels, close_tunnel, delete_env_profile,
     delete_server, init_config, list_compose_projects, list_compose_services, list_env_profiles,
-    list_servers, list_tunnels, open_tunnel, render_env, render_env_profile, save_env_profile,
-    save_server, set_active_env_profile, test_server, write_env_file, write_env_profile,
-    EnvPlainEntry, EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest, ServerConfig,
-    WriteEnvFileRequest, WriteEnvProfileRequest,
+    list_servers, list_tunnels, open_tunnel, preview_cleanup, render_env, render_env_profile,
+    save_env_profile, save_server, set_active_env_profile, test_server, write_env_file,
+    write_env_profile, EnvPlainEntry, EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest,
+    ServerConfig, WriteEnvFileRequest, WriteEnvProfileRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -31,10 +31,7 @@ enum Command {
     },
     Open(OpenArgs),
     Close(CloseArgs),
-    Cleanup {
-        #[arg(long)]
-        server: String,
-    },
+    Cleanup(CleanupArgs),
     Status,
     Env(EnvArgs),
 }
@@ -109,6 +106,14 @@ struct CloseArgs {
     tunnel_id: Option<String>,
     #[arg(long)]
     all: bool,
+}
+
+#[derive(Debug, Args)]
+struct CleanupArgs {
+    #[arg(long)]
+    server: String,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -205,10 +210,19 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("pass a tunnel id or --all");
             }
         }
-        Command::Cleanup { server } => {
-            let result = cleanup(server).await?;
+        Command::Cleanup(args) => {
+            let result = if args.dry_run {
+                preview_cleanup(args.server).await?
+            } else {
+                cleanup(args.server).await?
+            };
             if result.containers.is_empty() {
                 println!("No compose-tunnel containers found on {}", result.server);
+            } else if args.dry_run {
+                println!("Containers that would be removed on {}:", result.server);
+                for container in result.containers {
+                    println!("  {container}");
+                }
             } else {
                 println!("Removed containers on {}:", result.server);
                 for container in result.containers {
@@ -483,5 +497,25 @@ mod tests {
     fn rejects_plain_env_without_key_or_separator() {
         assert!(parse_plain_env("DATABASE_URL").is_err());
         assert!(parse_plain_env("=value").is_err());
+    }
+
+    #[test]
+    fn parses_cleanup_dry_run() {
+        let cli = Cli::try_parse_from([
+            "compose-tunnel",
+            "cleanup",
+            "--server",
+            "staging",
+            "--dry-run",
+        ])
+        .expect("cleanup dry run should parse");
+
+        match cli.command {
+            Command::Cleanup(args) => {
+                assert_eq!(args.server, "staging");
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected cleanup command"),
+        }
     }
 }

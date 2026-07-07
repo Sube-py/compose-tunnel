@@ -29,7 +29,8 @@ pub fn run() {
             commands::write_env_file,
             commands::render_env_profile,
             commands::write_env_profile,
-            commands::cleanup
+            commands::cleanup,
+            commands::preview_cleanup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
