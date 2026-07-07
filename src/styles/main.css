@@ -294,26 +294,6 @@ nav {
   font-size: 13px;
 }
 
-.env-layout {
-  display: grid;
-  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-}
-
-.env-projects-panel {
-  position: sticky;
-  top: 0;
-}
-
-.env-project-table .p-datatable-table {
-  min-width: 0;
-}
-
-.env-project-table .p-datatable-tbody > tr {
-  cursor: pointer;
-}
-
 .env-project-cell {
   display: flex;
   min-width: 0;
@@ -325,21 +305,14 @@ nav {
   color: #327968;
 }
 
-.env-project-cell div {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
 .env-project-cell strong {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
 
-.env-project-cell span {
-  color: #687873;
-  font-size: 12px;
+.env-select {
+  width: min(100%, 220px);
 }
 
 .env-table .p-datatable-tbody > tr > td {
@@ -355,7 +328,7 @@ nav {
 }
 
 .env-table .actions {
-  min-width: 220px;
+  min-width: 430px;
   align-items: flex-start;
 }
 
@@ -430,8 +403,7 @@ code {
 
 @media (max-width: 860px) {
   .shell,
-  .split,
-  .env-layout {
+  .split {
     grid-template-columns: 1fr;
   }
 
