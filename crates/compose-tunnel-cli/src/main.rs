@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    io::{self, IsTerminal, Write},
+    path::PathBuf,
+};
 
 use clap::{Args, Parser, Subcommand};
 use compose_tunnel_core::{
@@ -114,6 +117,8 @@ struct CleanupArgs {
     server: String,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -211,23 +216,37 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Cleanup(args) => {
-            let result = if args.dry_run {
-                preview_cleanup(args.server).await?
-            } else {
-                cleanup(args.server).await?
-            };
-            if result.containers.is_empty() {
-                println!("No compose-tunnel containers found on {}", result.server);
-            } else if args.dry_run {
+            if args.dry_run {
+                let result = preview_cleanup(args.server).await?;
+                if result.containers.is_empty() {
+                    println!("No compose-tunnel containers found on {}", result.server);
+                    return Ok(());
+                }
                 println!("Containers that would be removed on {}:", result.server);
                 for container in result.containers {
                     println!("  {container}");
                 }
-            } else {
-                println!("Removed containers on {}:", result.server);
-                for container in result.containers {
-                    println!("  {container}");
-                }
+                return Ok(());
+            }
+
+            let preview = preview_cleanup(args.server.clone()).await?;
+            if preview.containers.is_empty() {
+                println!("No compose-tunnel containers found on {}", preview.server);
+                return Ok(());
+            }
+            println!("Containers to remove on {}:", preview.server);
+            for container in &preview.containers {
+                println!("  {container}");
+            }
+            if !args.yes && !confirm_cleanup()? {
+                println!("Cleanup cancelled");
+                return Ok(());
+            }
+
+            let result = cleanup(args.server).await?;
+            println!("Removed containers on {}:", result.server);
+            for container in result.containers {
+                println!("  {container}");
             }
         }
         Command::Status => {
@@ -366,6 +385,21 @@ fn parse_plain_env(value: &str) -> anyhow::Result<EnvPlainEntry> {
         key: key.to_string(),
         value: entry_value.to_string(),
     })
+}
+
+fn confirm_cleanup() -> anyhow::Result<bool> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("cleanup requires --yes when stdin is not interactive");
+    }
+
+    print!("Remove these remote containers? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 async fn handle_server(command: ServerCommand) -> anyhow::Result<()> {
@@ -514,6 +548,22 @@ mod tests {
             Command::Cleanup(args) => {
                 assert_eq!(args.server, "staging");
                 assert!(args.dry_run);
+            }
+            _ => panic!("expected cleanup command"),
+        }
+    }
+
+    #[test]
+    fn parses_cleanup_yes() {
+        let cli =
+            Cli::try_parse_from(["compose-tunnel", "cleanup", "--server", "staging", "--yes"])
+                .expect("cleanup yes should parse");
+
+        match cli.command {
+            Command::Cleanup(args) => {
+                assert_eq!(args.server, "staging");
+                assert!(args.yes);
+                assert!(!args.dry_run);
             }
             _ => panic!("expected cleanup command"),
         }

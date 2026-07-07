@@ -39,7 +39,7 @@ cargo run -p compose-tunnel-cli -- env profile write staging-db
 cargo run -p compose-tunnel-cli -- env profile delete staging-db
 cargo run -p compose-tunnel-cli -- close db
 cargo run -p compose-tunnel-cli -- cleanup --server staging --dry-run
-cargo run -p compose-tunnel-cli -- cleanup --server staging
+cargo run -p compose-tunnel-cli -- cleanup --server staging --yes
 ```
 
 ## Run The Desktop App
@@ -69,7 +69,7 @@ The desktop app asks for confirmation before writing extra env keys that look se
 
 ## Cleanup
 
-`compose-tunnel cleanup --server <name> --dry-run` lists managed `compose-tunnel` containers that are safe to remove. Without `--dry-run`, the CLI removes those containers. The desktop app previews the same cleanup list and asks for confirmation before deleting remote containers.
+`compose-tunnel cleanup --server <name> --dry-run` lists managed `compose-tunnel` containers that are safe to remove. Without `--dry-run`, the CLI shows the same list and asks for confirmation before deleting remote containers. Use `--yes` for non-interactive scripts. The desktop app previews the cleanup list and asks for confirmation before deleting remote containers.
 
 ## Verify
 
