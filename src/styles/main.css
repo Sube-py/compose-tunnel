@@ -76,15 +76,9 @@ pre {
   font-size: 18px;
 }
 
-.brand p,
-.config-path {
+.brand p {
   color: #bdd0ca;
   font-size: 12px;
-}
-
-.config-path {
-  margin-top: auto;
-  overflow-wrap: anywhere;
 }
 
 nav {

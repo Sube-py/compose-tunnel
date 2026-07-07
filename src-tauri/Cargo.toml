@@ -1,8 +1,8 @@
 [package]
 name = "compose-tunnel"
 version.workspace = true
-description = "A Tauri App"
-authors = ["you"]
+description = "Forward remote Docker Compose internal services through SSH"
+authors.workspace = true
 edition.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

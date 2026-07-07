@@ -110,7 +110,6 @@ const confirm = useConfirm();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
 const logs = ref<string[]>([]);
-const configDir = ref("");
 const defaults = reactive<Defaults>({
   local_host: "127.0.0.1",
   socat_image: "alpine/socat:latest",
@@ -266,8 +265,7 @@ async function runTask<T>(message: string, task: () => Promise<T>, showSuccessTo
 
 async function bootstrap() {
   await runTask("Workspace loaded", async () => {
-    const paths = await invoke<{ config_dir: string }>("init_config");
-    configDir.value = paths.config_dir;
+    await invoke("init_config");
     const config = await invoke<{ defaults: Defaults }>("get_config");
     Object.assign(defaults, config.defaults);
     await refreshServers();
@@ -1067,7 +1065,6 @@ onMounted(bootstrap);
           @click="setTab(tab)"
         />
       </nav>
-      <div class="config-path">{{ configDir }}</div>
     </aside>
 
     <ScrollPanel class="workspace-scroll">
