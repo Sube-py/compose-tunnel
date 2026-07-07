@@ -818,10 +818,7 @@ pub async fn close_all_tunnels() -> Result<()> {
 pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
     let config = load_config().await?;
     let server = find_server(&config, &server_id)?;
-    let list_command = format!(
-        "{} ps -a --filter name=^/compose-tunnel- --format '{{{{.Names}}}}'",
-        docker_command(server)
-    );
+    let list_command = managed_container_list_command(&docker_command(server));
     let output = run_ssh(&config.defaults, server, &list_command).await?;
     let containers: Vec<String> = output
         .lines()
@@ -844,6 +841,10 @@ pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
         server: server_id,
         containers,
     })
+}
+
+fn managed_container_list_command(docker: &str) -> String {
+    format!("{docker} ps -a --filter label=compose-tunnel.managed=true --format '{{{{.Names}}}}'")
 }
 
 pub async fn render_env(tunnel_id: String) -> Result<String> {
@@ -1504,6 +1505,15 @@ mod tests {
         assert_eq!(normalize_env_name("server-db"), "server_db");
         assert_eq!(normalize_env_name("DATABASE-PORT"), "DATABASE_PORT");
         assert_eq!(normalize_env_name("1_PORT"), "_1_PORT");
+    }
+
+    #[test]
+    fn cleanup_lists_only_managed_labeled_containers() {
+        let command = managed_container_list_command("sudo -n docker");
+
+        assert!(command.contains("sudo -n docker ps -a"));
+        assert!(command.contains("--filter label=compose-tunnel.managed=true"));
+        assert!(!command.contains("--filter name="));
     }
 
     #[test]
