@@ -1358,7 +1358,7 @@ fn resolve_env_profile_value(value: &str, port_values: &BTreeMap<String, String>
 async fn write_env_profile_block(path: &Path, env: &str) -> Result<()> {
     let start = "# compose-tunnel:start env";
     let end = "# compose-tunnel:end env";
-    let block = format!("{start}\n{}{end}\n", env.trim_end());
+    let block = format_env_profile_block(env);
     let existing = match fs::read_to_string(path).await {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -1372,6 +1372,12 @@ async fn write_env_profile_block(path: &Path, env: &str) -> Result<()> {
     }
     fs::write(path, updated).await?;
     Ok(())
+}
+
+fn format_env_profile_block(env: &str) -> String {
+    let start = "# compose-tunnel:start env";
+    let end = "# compose-tunnel:end env";
+    format!("{start}\n{}\n{end}\n", env.trim_end())
 }
 
 fn replace_block(existing: &str, start: &str, end: &str, block: &str) -> String {
@@ -1588,6 +1594,26 @@ mod tests {
             updated,
             "A=1\n# compose-tunnel:start db\nDB_HOST=127.0.0.1\n# compose-tunnel:end db\nB=2\n"
         );
+    }
+
+    #[test]
+    fn env_profile_block_keeps_end_marker_on_its_own_line() {
+        let block = format_env_profile_block(
+            "# compose-tunnel env: test\nDATABASE_PORT=15432\nDATABASE_HOST=127.0.0.1\n",
+        );
+
+        assert_eq!(
+            block,
+            [
+                "# compose-tunnel:start env\n",
+                "# compose-tunnel env: test\n",
+                "DATABASE_PORT=15432\n",
+                "DATABASE_HOST=127.0.0.1\n",
+                "# compose-tunnel:end env\n",
+            ]
+            .concat()
+        );
+        assert!(!block.contains("127.0.0.1# compose-tunnel:end env"));
     }
 
     #[test]
