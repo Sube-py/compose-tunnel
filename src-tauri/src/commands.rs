@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use compose_tunnel_core::{
     active_env_profile as core_active_env_profile, active_env_profiles as core_active_env_profiles,
-    cleanup as core_cleanup, close_all_tunnels as core_close_all_tunnels,
-    close_tunnel as core_close_tunnel, delete_env_profile as core_delete_env_profile,
-    delete_server as core_delete_server, init_config as core_init_config,
-    list_compose_projects as core_list_compose_projects,
+    cleanup as core_cleanup, clear_active_env_profile as core_clear_active_env_profile,
+    close_all_tunnels as core_close_all_tunnels, close_tunnel as core_close_tunnel,
+    delete_env_profile as core_delete_env_profile, delete_server as core_delete_server,
+    init_config as core_init_config, list_compose_projects as core_list_compose_projects,
     list_compose_services as core_list_compose_services,
     list_env_profiles as core_list_env_profiles, list_servers as core_list_servers,
     list_tunnels as core_list_tunnels, load_config, open_tunnel as core_open_tunnel,
@@ -66,6 +66,14 @@ pub async fn delete_env_profile(name: String) -> CommandResult<()> {
 #[tauri::command]
 pub async fn set_active_env_profile(name: String) -> CommandResult<()> {
     core_set_active_env_profile(name).await.map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn clear_active_env_profile(target_dir: String) -> CommandResult<String> {
+    core_clear_active_env_profile(target_dir)
+        .await
+        .map(|path| path.display().to_string())
+        .map_err(map_error)
 }
 
 #[tauri::command]

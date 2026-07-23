@@ -15,6 +15,7 @@ pub fn run() {
             commands::save_env_profile,
             commands::delete_env_profile,
             commands::set_active_env_profile,
+            commands::clear_active_env_profile,
             commands::list_servers,
             commands::save_server,
             commands::delete_server,

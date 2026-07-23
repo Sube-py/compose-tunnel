@@ -303,16 +303,27 @@ nav {
 .env-project-cell {
   display: flex;
   min-width: 0;
+  min-height: 32px;
   align-items: center;
   gap: 10px;
 }
 
 .env-project-cell i {
+  display: inline-flex;
+  width: 1em;
+  height: 1em;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
   color: #327968;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .env-project-cell strong {
   min-width: 0;
+  font-weight: 600;
+  line-height: 1.2;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
@@ -337,7 +348,11 @@ nav {
 .env-table .p-datatable-tbody > tr > td {
   padding-top: 8px;
   padding-bottom: 8px;
-  vertical-align: top;
+  vertical-align: middle;
+}
+
+.env-table .p-datatable-tbody > tr > td:first-child {
+  vertical-align: middle;
 }
 
 .env-table .p-datatable-table {
@@ -437,6 +452,27 @@ nav {
 
 code {
   overflow-wrap: anywhere;
+}
+
+.tunnels-table .p-datatable-table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.tunnels-table .p-datatable-tbody > tr > td {
+  vertical-align: middle;
+}
+
+.tunnels-table .p-datatable-tbody > tr > td:last-child {
+  white-space: nowrap;
+}
+
+.cell-ellipsis {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 860px) {

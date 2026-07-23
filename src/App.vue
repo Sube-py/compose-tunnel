@@ -109,6 +109,7 @@ const toast = useToast();
 const confirm = useConfirm();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
+const busyActions = ref<Record<string, boolean>>({});
 const logs = ref<string[]>([]);
 const defaults = reactive<Defaults>({
   local_host: "127.0.0.1",
@@ -125,6 +126,7 @@ const envProfiles = ref<EnvProfileConfig[]>([]);
 const activeEnvProfiles = ref<Record<string, string>>({});
 const selectedEnvNames = ref<Record<string, string>>({});
 const selectedServer = ref("");
+const tunnelServerFilter = ref("all");
 const selectedProject = ref("");
 const envPreview = ref("");
 const editingServerName = ref("");
@@ -180,6 +182,16 @@ const dockerModeOptions = [
   { label: "custom", value: "custom" },
 ];
 const serverOptions = computed(() => servers.value.map((server) => ({ label: server.name, value: server.name })));
+const tunnelServerFilterOptions = computed(() => [
+  { label: "All", value: "all" },
+  ...serverOptions.value,
+]);
+const filteredTunnels = computed(() => {
+  if (tunnelServerFilter.value === "all" || !tunnelServerFilter.value) {
+    return tunnels.value;
+  }
+  return tunnels.value.filter((tunnel) => tunnel.server === tunnelServerFilter.value);
+});
 const envTunnelOptions = computed(() =>
   tunnels.value
     .map((tunnel) => ({
@@ -244,8 +256,31 @@ function log(message: string) {
   logs.value = logs.value.slice(0, 80);
 }
 
-async function runTask<T>(message: string, task: () => Promise<T>, showSuccessToast = true): Promise<T | null> {
+function isBusy(key: string) {
+  return Boolean(busyActions.value[key]);
+}
+
+function setBusy(key: string | undefined, value: boolean) {
+  if (!key) {
+    return;
+  }
+  if (value) {
+    busyActions.value = { ...busyActions.value, [key]: true };
+    return;
+  }
+  const next = { ...busyActions.value };
+  delete next[key];
+  busyActions.value = next;
+}
+
+async function runTask<T>(
+  message: string,
+  task: () => Promise<T>,
+  showSuccessToast = true,
+  busyKey?: string,
+): Promise<T | null> {
   loading.value = true;
+  setBusy(busyKey, true);
   try {
     const result = await task();
     log(message);
@@ -259,6 +294,7 @@ async function runTask<T>(message: string, task: () => Promise<T>, showSuccessTo
     toast.add({ severity: "error", summary: "Operation failed", detail: text, life: 5000 });
     return null;
   } finally {
+    setBusy(busyKey, false);
     loading.value = false;
   }
 }
@@ -279,6 +315,13 @@ async function refreshServers() {
   if (!selectedServer.value && servers.value.length > 0) {
     selectedServer.value = servers.value[0].name;
   }
+  if (
+    tunnelServerFilter.value !== "all" &&
+    tunnelServerFilter.value &&
+    !servers.value.some((server) => server.name === tunnelServerFilter.value)
+  ) {
+    tunnelServerFilter.value = "all";
+  }
   if (!tunnelForm.server && servers.value.length > 0) {
     tunnelForm.server = servers.value[0].name;
   }
@@ -286,6 +329,17 @@ async function refreshServers() {
 
 async function refreshTunnels() {
   tunnels.value = await invoke<TunnelState[]>("list_tunnels");
+}
+
+async function refreshTunnelsWithFeedback() {
+  await runTask(
+    "Tunnels refreshed",
+    async () => {
+      await refreshTunnels();
+    },
+    true,
+    "tunnels:refresh",
+  );
 }
 
 async function refreshEnvProfiles() {
@@ -306,16 +360,21 @@ async function refreshEnvProfiles() {
 }
 
 async function saveServer() {
-  await runTask(`Saved server ${serverForm.name}`, async () => {
-    const server = compactServer(serverForm);
-    if (editingServerName.value && editingServerName.value !== server.name) {
-      await invoke("delete_server", { name: editingServerName.value });
-    }
-    await invoke("save_server", { server });
-    clearServerForm();
-    serverDialogVisible.value = false;
-    await refreshServers();
-  });
+  await runTask(
+    `Saved server ${serverForm.name}`,
+    async () => {
+      const server = compactServer(serverForm);
+      if (editingServerName.value && editingServerName.value !== server.name) {
+        await invoke("delete_server", { name: editingServerName.value });
+      }
+      await invoke("save_server", { server });
+      clearServerForm();
+      serverDialogVisible.value = false;
+      await refreshServers();
+    },
+    true,
+    "server:save",
+  );
 }
 
 async function deleteServer(name: string) {
@@ -339,16 +398,23 @@ async function deleteServer(name: string) {
 }
 
 async function runDeleteServer(name: string) {
-  await runTask(`Deleted server ${name}`, async () => {
-    await invoke("delete_server", { name });
-    await refreshServers();
-  });
+  await runTask(
+    `Deleted server ${name}`,
+    async () => {
+      await invoke("delete_server", { name });
+      await refreshServers();
+    },
+    true,
+    `server:delete:${name}`,
+  );
 }
 
 async function testServer(name: string) {
-  const result = await runTask(`Tested server ${name}`, async () =>
-    invoke<{ details: string[] }>("test_server", { serverId: name }),
+  const result = await runTask(
+    `Tested server ${name}`,
+    async () => invoke<{ details: string[] }>("test_server", { serverId: name }),
     false,
+    `server:test:${name}`,
   );
   if (result) {
     logs.value.unshift(...result.details.map((detail) => `${new Date().toLocaleTimeString()} ${detail}`));
@@ -393,8 +459,11 @@ async function discoverProjects() {
     toast.add({ severity: "warn", summary: "Select a server first", life: 3000 });
     return;
   }
-  const result = await runTask(`Discovered projects on ${selectedServer.value}`, async () =>
-    invoke<ComposeProject[]>("list_compose_projects", { serverId: selectedServer.value }),
+  const result = await runTask(
+    `Discovered projects on ${selectedServer.value}`,
+    async () => invoke<ComposeProject[]>("list_compose_projects", { serverId: selectedServer.value }),
+    true,
+    "compose:discover",
   );
   if (result) {
     projects.value = result;
@@ -405,11 +474,15 @@ async function discoverProjects() {
 
 async function loadServices(project: string) {
   selectedProject.value = project;
-  const result = await runTask(`Loaded services for ${project}`, async () =>
-    invoke<ComposeService[]>("list_compose_services", {
-      serverId: selectedServer.value,
-      project,
-    }),
+  const result = await runTask(
+    `Loaded services for ${project}`,
+    async () =>
+      invoke<ComposeService[]>("list_compose_services", {
+        serverId: selectedServer.value,
+        project,
+      }),
+    true,
+    `compose:services:${project}`,
   );
   if (result) {
     services.value = result;
@@ -431,27 +504,38 @@ function pickService(service: ComposeService) {
 }
 
 async function openTunnel() {
-  await runTask(`Opened tunnel for ${tunnelForm.service}`, async () => {
-    await invoke("open_tunnel", {
-      request: {
-        server: tunnelForm.server,
-        project: tunnelForm.project,
-        service: tunnelForm.service,
-        target_port: Number(tunnelForm.target_port),
-        network: optional(tunnelForm.network),
-        local_port: tunnelForm.local_port ? Number(tunnelForm.local_port) : null,
-        local_host: defaults.local_host,
-        socat_port: null,
-        socat_image: optional(tunnelForm.socat_image),
-      },
-    });
-    tunnelForm.local_port = "";
-    tunnelDialogVisible.value = false;
-    await refreshTunnels();
-  });
+  await runTask(
+    `Opened tunnel for ${tunnelForm.service}`,
+    async () => {
+      await invoke("open_tunnel", {
+        request: {
+          server: tunnelForm.server,
+          project: tunnelForm.project,
+          service: tunnelForm.service,
+          target_port: Number(tunnelForm.target_port),
+          network: optional(tunnelForm.network),
+          local_port: tunnelForm.local_port ? Number(tunnelForm.local_port) : null,
+          local_host: defaults.local_host,
+          socat_port: null,
+          socat_image: optional(tunnelForm.socat_image),
+        },
+      });
+      tunnelForm.local_port = "";
+      tunnelDialogVisible.value = false;
+      await refreshTunnels();
+    },
+    true,
+    "tunnel:create",
+  );
 }
 
 function openTunnelDialog() {
+  if (tunnelServerFilter.value !== "all" && tunnelServerFilter.value) {
+    tunnelForm.server = tunnelServerFilter.value;
+    selectedServer.value = tunnelServerFilter.value;
+  } else if (!tunnelForm.server && servers.value.length > 0) {
+    tunnelForm.server = servers.value[0].name;
+  }
   tunnelDialogVisible.value = true;
 }
 
@@ -462,8 +546,11 @@ async function onTunnelServerChange() {
   tunnelForm.network = "";
   services.value = [];
   if (tunnelForm.server) {
-    const result = await runTask(`Discovered projects on ${tunnelForm.server}`, async () =>
-      invoke<ComposeProject[]>("list_compose_projects", { serverId: tunnelForm.server }),
+    const result = await runTask(
+      `Discovered projects on ${tunnelForm.server}`,
+      async () => invoke<ComposeProject[]>("list_compose_projects", { serverId: tunnelForm.server }),
+      true,
+      "compose:discover",
     );
     if (result) {
       projects.value = result;
@@ -495,10 +582,15 @@ function onTunnelServiceChange() {
 }
 
 async function closeTunnel(id: string) {
-  await runTask(`Stopped tunnel ${id}`, async () => {
-    await invoke("close_tunnel", { tunnelId: id });
-    await refreshTunnels();
-  });
+  await runTask(
+    `Stopped tunnel ${id}`,
+    async () => {
+      await invoke("close_tunnel", { tunnelId: id });
+      await refreshTunnels();
+    },
+    true,
+    `tunnel:stop:${id}`,
+  );
 }
 
 async function stopAllTunnels() {
@@ -522,21 +614,28 @@ async function stopAllTunnels() {
 }
 
 async function runStopAllTunnels() {
-  await runTask("Stopped all tunnels", async () => {
-    await invoke("close_all_tunnels");
-    await refreshTunnels();
-  });
+  await runTask(
+    "Stopped all tunnels",
+    async () => {
+      await invoke("close_all_tunnels");
+      await refreshTunnels();
+    },
+    true,
+    "tunnel:stop-all",
+  );
 }
 
 async function cleanupSelectedServer() {
-  if (!selectedServer.value) {
+  if (tunnelServerFilter.value === "all" || !tunnelServerFilter.value) {
     toast.add({ severity: "warn", summary: "Select a server first", life: 3000 });
     return;
   }
+  const serverId = tunnelServerFilter.value;
   const preview = await runTask(
-    `Previewed cleanup ${selectedServer.value}`,
-    async () => invoke<CleanupResult>("preview_cleanup", { serverId: selectedServer.value }),
+    `Previewed cleanup ${serverId}`,
+    async () => invoke<CleanupResult>("preview_cleanup", { serverId }),
     false,
+    "tunnel:cleanup",
   );
   if (!preview) {
     return;
@@ -562,16 +661,17 @@ async function cleanupSelectedServer() {
       severity: "danger",
     },
     accept: () => {
-      void runCleanupSelectedServer();
+      void runCleanupSelectedServer(serverId);
     },
   });
 }
 
-async function runCleanupSelectedServer() {
+async function runCleanupSelectedServer(serverId: string) {
   const result = await runTask(
-    `Cleaned up ${selectedServer.value}`,
-    async () => invoke<CleanupResult>("cleanup", { serverId: selectedServer.value }),
+    `Cleaned up ${serverId}`,
+    async () => invoke<CleanupResult>("cleanup", { serverId }),
     false,
+    "tunnel:cleanup",
   );
   if (!result) {
     return;
@@ -587,18 +687,15 @@ async function runCleanupSelectedServer() {
 }
 
 async function startTunnel(tunnel: TunnelState) {
-  await runTask(`Started tunnel ${tunnel.id}`, async () => {
-    await openTunnelFromState(tunnel, null);
-    await refreshTunnels();
-  });
-}
-
-async function restartTunnel(tunnel: TunnelState) {
-  await runTask(`Restarted tunnel ${tunnel.id}`, async () => {
-    await invoke("close_tunnel", { tunnelId: tunnel.id });
-    await openTunnelFromState(tunnel, tunnel.local_port);
-    await refreshTunnels();
-  });
+  await runTask(
+    `Started tunnel ${tunnel.id}`,
+    async () => {
+      await openTunnelFromState(tunnel, null);
+      await refreshTunnels();
+    },
+    true,
+    `tunnel:start:${tunnel.id}`,
+  );
 }
 
 async function openTunnelFromState(tunnel: TunnelState, localPort: number | null) {
@@ -618,9 +715,14 @@ async function openTunnelFromState(tunnel: TunnelState, localPort: number | null
 }
 
 async function saveDefaultSettings() {
-  await runTask("Saved settings", async () => {
-    await invoke("save_defaults", { defaults: { ...defaults } });
-  });
+  await runTask(
+    "Saved settings",
+    async () => {
+      await invoke("save_defaults", { defaults: { ...defaults } });
+    },
+    true,
+    "settings:save",
+  );
 }
 
 function newEnvProfile() {
@@ -742,6 +844,7 @@ async function saveEnvProfile(showToast = true, closeDialog = false) {
       }
     },
     showToast,
+    "env:save",
   );
   return result !== null;
 }
@@ -772,14 +875,19 @@ async function deleteEnvProfile(profile?: EnvProfileConfig) {
 }
 
 async function runDeleteEnvProfile(name: string) {
-  await runTask(`Deleted env ${name}`, async () => {
-    await invoke("delete_env_profile", { name });
-    if (selectedEnvProfileName.value === name) {
-      newEnvProfile();
-      envDialogVisible.value = false;
-    }
-    await refreshEnvProfiles();
-  });
+  await runTask(
+    `Deleted env ${name}`,
+    async () => {
+      await invoke("delete_env_profile", { name });
+      if (selectedEnvProfileName.value === name) {
+        newEnvProfile();
+        envDialogVisible.value = false;
+      }
+      await refreshEnvProfiles();
+    },
+    true,
+    `env:delete:${name}`,
+  );
 }
 
 async function chooseEnvProject() {
@@ -846,10 +954,18 @@ async function deleteActiveEnvForProject(project: EnvProjectRow) {
   await deleteEnvProfile(profile);
 }
 
+function isProjectEnvActive(project: EnvProjectRow) {
+  return Boolean(project.active_name);
+}
+
 async function enableProjectEnv(project: EnvProjectRow) {
   const profile = selectedProfileForProject(project);
   if (!profile) {
     toast.add({ severity: "warn", summary: "Select an env first", life: 3000 });
+    return;
+  }
+  if (isActiveEnvProfile(profile) && project.active_name === profile.name) {
+    await disableProjectEnv(project);
     return;
   }
   const sensitiveKeys = sensitiveEnvKeys(profile);
@@ -876,27 +992,79 @@ async function enableProjectEnv(project: EnvProjectRow) {
   await runEnableProjectEnv(profile);
 }
 
+async function disableProjectEnv(project: EnvProjectRow) {
+  if (!project.active_name) {
+    toast.add({ severity: "warn", summary: "No active env for this project", life: 3000 });
+    return;
+  }
+  confirm.require({
+    header: "Disable env",
+    message: `Remove compose-tunnel env block from ${project.label}'s .env and mark ${project.active_name} inactive? Existing tunnels stay running.`,
+    icon: "pi pi-exclamation-triangle",
+    rejectProps: {
+      label: "Cancel",
+      severity: "secondary",
+      outlined: true,
+    },
+    acceptProps: {
+      label: "Disable",
+      severity: "danger",
+    },
+    accept: () => {
+      void runDisableProjectEnv(project);
+    },
+  });
+}
+
 async function runEnableProjectEnv(profile: EnvProfileConfig) {
-  await runTask(`Enabled env ${profile.name}`, async () => {
-    for (const binding of profile.tunnel_ports) {
-      const tunnel = tunnels.value.find((item) => item.id === binding.tunnel_id);
-      if (!tunnel) {
-        throw new Error(`Tunnel ${binding.tunnel_id} was not found`);
+  await runTask(
+    `Enabled env ${profile.name}`,
+    async () => {
+      for (const binding of profile.tunnel_ports) {
+        const tunnel = tunnels.value.find((item) => item.id === binding.tunnel_id);
+        if (!tunnel) {
+          throw new Error(`Tunnel ${binding.tunnel_id} was not found`);
+        }
+        if (tunnel.status !== "running") {
+          await openTunnelFromState(tunnel, null);
+        }
       }
-      if (tunnel.status !== "running") {
-        await openTunnelFromState(tunnel, null);
+      await refreshTunnels();
+      await invoke("set_active_env_profile", { name: profile.name });
+      const path = await invoke<string>("write_env_profile", {
+        request: { name: profile.name },
+      });
+      await refreshEnvProfiles();
+      selectedEnvNames.value[envTargetKey(profile)] = profile.name;
+      envPreview.value = await invoke<string>("render_env_profile", { name: profile.name });
+      toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
+    },
+    false,
+    `env:enable:${envTargetKey(profile)}`,
+  );
+}
+
+async function runDisableProjectEnv(project: EnvProjectRow) {
+  await runTask(
+    `Disabled env for ${project.label}`,
+    async () => {
+      const path = await invoke<string>("clear_active_env_profile", {
+        targetDir: project.target_dir,
+      });
+      await refreshEnvProfiles();
+      if (envPreview.value) {
+        envPreview.value = "";
       }
-    }
-    await refreshTunnels();
-    await invoke("set_active_env_profile", { name: profile.name });
-    const path = await invoke<string>("write_env_profile", {
-      request: { name: profile.name },
-    });
-    await refreshEnvProfiles();
-    selectedEnvNames.value[envTargetKey(profile)] = profile.name;
-    envPreview.value = await invoke<string>("render_env_profile", { name: profile.name });
-    toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
-  }, false);
+      toast.add({
+        severity: "info",
+        summary: "Removed env overlay",
+        detail: path,
+        life: 4500,
+      });
+    },
+    false,
+    `env:disable:${project.target_dir}`,
+  );
 }
 
 function defaultPortAlias(tunnel: TunnelState) {
@@ -946,8 +1114,11 @@ async function renderEnvProfilePreview(profile?: EnvProfileConfig) {
     }
     name = envProfileForm.name.trim();
   }
-  const result = await runTask(`Rendered env ${name}`, async () =>
-    invoke<string>("render_env_profile", { name }),
+  const result = await runTask(
+    `Rendered env ${name}`,
+    async () => invoke<string>("render_env_profile", { name }),
+    true,
+    `env:preview:${name}`,
   );
   if (result !== null) {
     envPreview.value = result;
@@ -1035,6 +1206,14 @@ function statusSeverity(status: string) {
   return "secondary";
 }
 
+function tunnelRemoteLabel(tunnel: TunnelState) {
+  return `${tunnel.server} / ${tunnel.project} / ${tunnel.service}:${tunnel.target_port}`;
+}
+
+function tunnelLocalLabel(tunnel: TunnelState) {
+  return `${tunnel.local_host}:${tunnel.local_port}`;
+}
+
 function onDockerModeChange(value: string) {
   applyDockerCommandPreset(value);
 }
@@ -1074,7 +1253,7 @@ onMounted(bootstrap);
             <h2>{{ activeTab }}</h2>
             <p>{{ runningCount }} running tunnels, {{ stoppedCount }} stopped</p>
           </div>
-          <Button label="Refresh" icon="pi pi-refresh" :loading="loading" @click="refreshTunnels" />
+          <Button label="Refresh" icon="pi pi-refresh" :loading="isBusy('tunnels:refresh') || loading" @click="refreshTunnelsWithFeedback" />
         </header>
 
       <section v-if="activeTab === 'Dashboard'" class="page">
@@ -1093,7 +1272,7 @@ onMounted(bootstrap);
           <Button label="Add Server" icon="pi pi-server" outlined @click="setTab('Servers')" />
           <Button label="Discover Compose" icon="pi pi-search" outlined @click="setTab('Compose')" />
           <Button label="Open Tunnel" icon="pi pi-share-alt" outlined @click="setTab('Tunnels')" />
-          <Button label="Stop All" icon="pi pi-stop" severity="danger" outlined :disabled="runningCount === 0" @click="stopAllTunnels" />
+          <Button label="Stop All" icon="pi pi-stop" severity="danger" outlined :loading="isBusy('tunnel:stop-all')" :disabled="runningCount === 0 || isBusy('tunnel:stop-all')" @click="stopAllTunnels" />
         </div>
         <DataTable :value="tunnels" size="small" stripedRows>
           <Column field="id" header="ID" />
@@ -1129,8 +1308,8 @@ onMounted(bootstrap);
               <template #body="{ data }">
                 <div class="actions">
                   <Button icon="pi pi-pencil" label="Edit" size="small" text @click="editServer(data)" />
-                  <Button icon="pi pi-check-circle" label="Test" size="small" text @click="testServer(data.name)" />
-                  <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteServer(data.name)" />
+                  <Button icon="pi pi-check-circle" label="Test" size="small" text :loading="isBusy(`server:test:${data.name}`)" :disabled="isBusy(`server:test:${data.name}`)" @click="testServer(data.name)" />
+                  <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text :loading="isBusy(`server:delete:${data.name}`)" :disabled="isBusy(`server:delete:${data.name}`)" @click="deleteServer(data.name)" />
                 </div>
               </template>
             </Column>
@@ -1154,8 +1333,8 @@ onMounted(bootstrap);
               <label>Default socat image<InputText v-model="serverForm.default_socat_image" placeholder="alpine/socat:latest" /></label>
             </div>
             <div class="dialog-actions">
-              <Button label="Cancel" severity="secondary" outlined type="button" @click="serverDialogVisible = false" />
-              <Button :label="editingServerName ? 'Update' : 'Save'" icon="pi pi-save" type="submit" />
+              <Button label="Cancel" severity="secondary" outlined type="button" :disabled="isBusy('server:save')" @click="serverDialogVisible = false" />
+              <Button :label="editingServerName ? 'Update' : 'Save'" icon="pi pi-save" type="submit" :loading="isBusy('server:save')" :disabled="isBusy('server:save')" />
             </div>
           </form>
         </Dialog>
@@ -1164,13 +1343,13 @@ onMounted(bootstrap);
       <section v-if="activeTab === 'Compose'" class="page">
         <div class="toolbar">
           <Select v-model="selectedServer" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" />
-          <Button label="Discover" icon="pi pi-search" :loading="loading" @click="discoverProjects" />
+          <Button label="Discover" icon="pi pi-search" :loading="isBusy('compose:discover')" :disabled="isBusy('compose:discover')" @click="discoverProjects" />
         </div>
         <div class="project-grid">
           <article v-for="project in projects" :key="project.project" class="panel">
             <div class="project-card-header">
               <h3>{{ project.project }}</h3>
-              <Button label="Services" icon="pi pi-list" size="small" outlined @click="loadServices(project.project)" />
+              <Button label="Services" icon="pi pi-list" size="small" outlined :loading="isBusy(`compose:services:${project.project}`)" :disabled="isBusy(`compose:services:${project.project}`)" @click="loadServices(project.project)" />
             </div>
             <p>{{ project.services.join(', ') }}</p>
           </article>
@@ -1191,29 +1370,49 @@ onMounted(bootstrap);
             <h3>Tunnels</h3>
             <div class="toolbar">
               <Button label="Create Tunnel" icon="pi pi-plus" @click="openTunnelDialog" />
-              <Select v-model="selectedServer" :options="serverOptions" optionLabel="label" optionValue="value" placeholder="Select server" />
-              <Button label="Cleanup" icon="pi pi-trash" severity="danger" outlined @click="cleanupSelectedServer" />
+              <Select
+                v-model="tunnelServerFilter"
+                :options="tunnelServerFilterOptions"
+                optionLabel="label"
+                optionValue="value"
+                placeholder="All"
+              />
+              <Button
+                label="Cleanup"
+                icon="pi pi-trash"
+                severity="danger"
+                outlined
+                :loading="isBusy('tunnel:cleanup')"
+                :disabled="tunnelServerFilter === 'all' || isBusy('tunnel:cleanup')"
+                @click="cleanupSelectedServer"
+              />
             </div>
           </div>
-          <DataTable :value="tunnels" size="small" stripedRows>
+          <DataTable :value="filteredTunnels" size="small" stripedRows class="tunnels-table">
             <template #empty>
-              <div class="empty-state">No tunnels yet.</div>
+              <div class="empty-state">{{ tunnelServerFilter === 'all' ? 'No tunnels yet.' : 'No tunnels for this server.' }}</div>
             </template>
-            <Column field="id" header="ID" />
-            <Column header="Remote"><template #body="{ data }">{{ data.server }} / {{ data.project }} / {{ data.service }}:{{ data.target_port }}</template></Column>
-            <Column header="Local"><template #body="{ data }">{{ data.local_host }}:{{ data.local_port }}</template></Column>
-            <Column header="Status"><template #body="{ data }"><Tag :value="data.status" :severity="statusSeverity(data.status)" /></template></Column>
-            <Column header="">
+            <Column field="id" header="ID" style="width: 18%">
+              <template #body="{ data }">
+                <span v-tooltip.top="data.id" class="cell-ellipsis">{{ data.id }}</span>
+              </template>
+            </Column>
+            <Column header="Remote" style="width: 42%">
+              <template #body="{ data }">
+                <span v-tooltip.top="tunnelRemoteLabel(data)" class="cell-ellipsis">{{ tunnelRemoteLabel(data) }}</span>
+              </template>
+            </Column>
+            <Column header="Local" style="width: 18%">
+              <template #body="{ data }">
+                <span v-tooltip.top="tunnelLocalLabel(data)" class="cell-ellipsis">{{ tunnelLocalLabel(data) }}</span>
+              </template>
+            </Column>
+            <Column header="Status" style="width: 10%">
+              <template #body="{ data }"><Tag :value="data.status" :severity="statusSeverity(data.status)" /></template>
+            </Column>
+            <Column header="" style="width: 12%">
               <template #body="{ data }">
                 <div class="actions">
-                  <Button
-                    v-if="data.status === 'running'"
-                    icon="pi pi-refresh"
-                    label="Restart"
-                    size="small"
-                    text
-                    @click="restartTunnel(data)"
-                  />
                   <Button
                     v-if="data.status === 'running'"
                     label="Stop"
@@ -1221,9 +1420,21 @@ onMounted(bootstrap);
                     size="small"
                     severity="danger"
                     outlined
+                    :loading="isBusy(`tunnel:stop:${data.id}`)"
+                    :disabled="isBusy(`tunnel:stop:${data.id}`)"
                     @click="closeTunnel(data.id)"
                   />
-                  <Button v-else label="Start" icon="pi pi-play" size="small" severity="success" outlined @click="startTunnel(data)" />
+                  <Button
+                    v-else
+                    label="Start"
+                    icon="pi pi-play"
+                    size="small"
+                    severity="success"
+                    outlined
+                    :loading="isBusy(`tunnel:start:${data.id}`)"
+                    :disabled="isBusy(`tunnel:start:${data.id}`)"
+                    @click="startTunnel(data)"
+                  />
                 </div>
               </template>
             </Column>
@@ -1255,8 +1466,8 @@ onMounted(bootstrap);
               <label>socat image<InputText v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
             </div>
             <div class="dialog-actions">
-              <Button label="Cancel" severity="secondary" outlined type="button" @click="tunnelDialogVisible = false" />
-              <Button label="Start" icon="pi pi-play" type="submit" />
+              <Button label="Cancel" severity="secondary" outlined type="button" :disabled="isBusy('tunnel:create')" @click="tunnelDialogVisible = false" />
+              <Button label="Start" icon="pi pi-play" type="submit" :loading="isBusy('tunnel:create')" :disabled="isBusy('tunnel:create')" />
             </div>
           </form>
         </Dialog>
@@ -1296,10 +1507,48 @@ onMounted(bootstrap);
             <Column header="Actions">
               <template #body="{ data }">
                 <div class="actions">
-                  <Button icon="pi pi-play" label="Enable" size="small" severity="success" outlined @click="enableProjectEnv(data)" />
+                  <Button
+                    v-if="isProjectEnvActive(data)"
+                    icon="pi pi-stop"
+                    label="Disable"
+                    size="small"
+                    severity="danger"
+                    outlined
+                    :loading="isBusy(`env:disable:${data.target_dir}`)"
+                    :disabled="isBusy(`env:disable:${data.target_dir}`)"
+                    @click="disableProjectEnv(data)"
+                  />
+                  <Button
+                    v-else
+                    icon="pi pi-play"
+                    label="Enable"
+                    size="small"
+                    severity="success"
+                    outlined
+                    :loading="isBusy(`env:enable:${data.target_dir}`)"
+                    :disabled="isBusy(`env:enable:${data.target_dir}`)"
+                    @click="enableProjectEnv(data)"
+                  />
                   <Button icon="pi pi-pencil" label="Edit" size="small" text @click="openEditProjectEnv(data)" />
-                  <Button icon="pi pi-eye" label="Preview" size="small" text @click="previewProjectEnv(data)" />
-                  <Button icon="pi pi-trash" label="Delete" size="small" severity="danger" text @click="deleteActiveEnvForProject(data)" />
+                  <Button
+                    icon="pi pi-eye"
+                    label="Preview"
+                    size="small"
+                    text
+                    :loading="isBusy(`env:preview:${data.selected_name}`)"
+                    :disabled="!data.selected_name || isBusy(`env:preview:${data.selected_name}`)"
+                    @click="previewProjectEnv(data)"
+                  />
+                  <Button
+                    icon="pi pi-trash"
+                    label="Delete"
+                    size="small"
+                    severity="danger"
+                    text
+                    :loading="isBusy(`env:delete:${data.selected_name}`)"
+                    :disabled="!data.selected_name || isBusy(`env:delete:${data.selected_name}`)"
+                    @click="deleteActiveEnvForProject(data)"
+                  />
                 </div>
               </template>
             </Column>
@@ -1329,8 +1578,8 @@ onMounted(bootstrap);
                 />
               </label>
               <label>Env name<InputText v-model="envProfileForm.name" placeholder="test" /></label>
-              <Button label="New Env" icon="pi pi-plus" outlined type="button" @click="newEnvProfileInDialog" />
-              <Button label="Save" icon="pi pi-save" type="button" @click="saveEnvProfile(true, true)" />
+              <Button label="New Env" icon="pi pi-plus" outlined type="button" :disabled="isBusy('env:save')" @click="newEnvProfileInDialog" />
+              <Button label="Save" icon="pi pi-save" type="button" :loading="isBusy('env:save')" :disabled="isBusy('env:save')" @click="saveEnvProfile(true, true)" />
             </div>
 
             <div class="panel nested-panel">
@@ -1413,7 +1662,7 @@ onMounted(bootstrap);
         <label>socat command<InputText v-model="defaults.socat_command" /></label>
         <label>SSH binary<InputText v-model="defaults.ssh_binary" /></label>
         <label>Docker timeout seconds<InputNumber v-model="defaults.docker_timeout_secs" :min="1" :useGrouping="false" fluid /></label>
-        <Button label="Save Settings" icon="pi pi-save" @click="saveDefaultSettings" />
+        <Button label="Save Settings" icon="pi pi-save" :loading="isBusy('settings:save')" :disabled="isBusy('settings:save')" @click="saveDefaultSettings" />
       </section>
       </section>
     </ScrollPanel>

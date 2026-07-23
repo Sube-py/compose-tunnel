@@ -510,6 +510,28 @@ pub async fn set_active_env_profile(name: String) -> Result<()> {
     save_config(&config).await
 }
 
+pub async fn clear_active_env_profile(target_dir: String) -> Result<PathBuf> {
+    let mut config = load_config().await?;
+    let target_key = normalize_target_dir_key(&target_dir)?;
+    config.active_env_profiles = active_env_profiles_for_config(&config);
+    config.active_env_profiles.remove(&target_key);
+    if config
+        .active_env_profile
+        .as_ref()
+        .and_then(|name| config.env_profiles.iter().find(|profile| &profile.name == name))
+        .and_then(|profile| env_profile_target_key(profile).ok())
+        .as_ref()
+        == Some(&target_key)
+    {
+        config.active_env_profile = None;
+    }
+    save_config(&config).await?;
+
+    let env_file = PathBuf::from(&target_key).join(".env");
+    clear_env_profile_block(&env_file).await?;
+    Ok(env_file)
+}
+
 pub async fn list_tunnels() -> Result<Vec<TunnelState>> {
     Ok(load_refreshed_state().await?.tunnels)
 }
@@ -985,21 +1007,29 @@ fn env_profile_target_key(profile: &EnvProfileConfig) -> Result<String> {
         .to_string())
 }
 
-fn env_profile_target_dir(profile: &EnvProfileConfig) -> Result<PathBuf> {
-    let target_dir = profile
-        .target_dir
-        .as_ref()
-        .ok_or_else(|| AppError::msg("target directory is required"))?;
-    let target_dir = target_dir.to_string_lossy().trim().to_string();
+fn normalize_target_dir_key(target_dir: &str) -> Result<String> {
+    let target_dir = target_dir.trim();
     if target_dir.is_empty() {
         return Err(AppError::msg("target directory is required"));
     }
-    let expanded = expand_home(&target_dir);
-    if expanded.is_absolute() {
-        Ok(expanded)
+    let expanded = expand_home(target_dir);
+    let absolute = if expanded.is_absolute() {
+        expanded
     } else {
-        Ok(std::env::current_dir()?.join(expanded))
-    }
+        std::env::current_dir()?.join(expanded)
+    };
+    Ok(absolute.to_string_lossy().trim().to_string())
+}
+
+fn env_profile_target_dir(profile: &EnvProfileConfig) -> Result<PathBuf> {
+    Ok(PathBuf::from(normalize_target_dir_key(
+        profile
+            .target_dir
+            .as_ref()
+            .ok_or_else(|| AppError::msg("target directory is required"))?
+            .to_string_lossy()
+            .as_ref(),
+    )?))
 }
 
 fn validate_name(label: &str, value: &str) -> Result<()> {
@@ -1288,7 +1318,18 @@ fn normalize_env_name(value: &str) -> String {
 }
 
 fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Result<String> {
-    let mut lines = vec![format!("# compose-tunnel env: {}", profile.name)];
+    render_env_profile_at(profile, state, &local_timestamp_string())
+}
+
+fn render_env_profile_at(
+    profile: &EnvProfileConfig,
+    state: &AppState,
+    created_at: &str,
+) -> Result<String> {
+    let mut lines = vec![
+        format!("# compose-tunnel env: {}", profile.name),
+        format!("# created_at: {created_at}"),
+    ];
     let mut port_values = BTreeMap::new();
 
     for binding in &profile.tunnel_ports {
@@ -1303,6 +1344,16 @@ fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Res
         let alias = normalize_env_name(&binding.alias);
         let port = tunnel.local_port.to_string();
         port_values.insert(alias.clone(), port.clone());
+        lines.push(format!("# tunnel: {alias}"));
+        lines.push(format!("#   server: {}", tunnel.server));
+        lines.push(format!("#   project: {}", tunnel.project));
+        lines.push(format!("#   service: {}", tunnel.service));
+        lines.push(format!("#   container: {}", tunnel.socat_container));
+        lines.push(format!("#   remote_port: {}", tunnel.target_port));
+        lines.push(format!(
+            "#   local: {}:{}",
+            tunnel.local_host, tunnel.local_port
+        ));
         lines.push(format!("{alias}={port}"));
         if let Some(env_key) = binding.env_key.as_ref().map(|value| value.trim()) {
             if !env_key.is_empty() {
@@ -1324,6 +1375,12 @@ fn render_env_profile_inner(profile: &EnvProfileConfig, state: &AppState) -> Res
 
     lines.push(String::new());
     Ok(lines.join("\n"))
+}
+
+fn local_timestamp_string() -> String {
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 fn resolve_env_profile_value(value: &str, port_values: &BTreeMap<String, String>) -> String {
@@ -1371,6 +1428,26 @@ async fn write_env_profile_block(path: &Path, env: &str) -> Result<()> {
         fs::create_dir_all(parent).await?;
     }
     fs::write(path, updated).await?;
+    Ok(())
+}
+
+async fn clear_env_profile_block(path: &Path) -> Result<()> {
+    let existing = match fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let cleaned = remove_env_profile_blocks(&existing);
+    if cleaned == existing {
+        return Ok(());
+    }
+    if cleaned.trim().is_empty() {
+        if path.exists() {
+            fs::remove_file(path).await?;
+        }
+        return Ok(());
+    }
+    fs::write(path, cleaned).await?;
     Ok(())
 }
 
@@ -1614,6 +1691,24 @@ mod tests {
             .concat()
         );
         assert!(!block.contains("127.0.0.1# compose-tunnel:end env"));
+    }
+
+    #[test]
+    fn remove_env_profile_blocks_keeps_user_env_content() {
+        let existing = [
+            "APP_NAME=demo\n",
+            "# compose-tunnel:start env\n",
+            "DATABASE_PORT=15432\n",
+            "# compose-tunnel:end env\n",
+            "USER_KEY=keep-me\n",
+        ]
+        .concat();
+
+        let cleaned = remove_env_profile_blocks(&existing);
+
+        assert_eq!(cleaned, "APP_NAME=demo\nUSER_KEY=keep-me\n");
+        assert!(!cleaned.contains("compose-tunnel"));
+        assert!(!cleaned.contains("DATABASE_PORT"));
     }
 
     #[test]
@@ -1912,8 +2007,18 @@ mod tests {
             }],
         };
 
-        let rendered = render_env_profile_inner(&profile, &state).expect("profile should render");
+        let rendered =
+            render_env_profile_at(&profile, &state, "2026-07-21 16:30:45").expect("profile should render");
 
+        assert!(rendered.contains("# compose-tunnel env: test"));
+        assert!(rendered.contains("# created_at: 2026-07-21 16:30:45"));
+        assert!(rendered.contains("# tunnel: server_db"));
+        assert!(rendered.contains("#   server: staging"));
+        assert!(rendered.contains("#   project: app"));
+        assert!(rendered.contains("#   service: db"));
+        assert!(rendered.contains("#   container: compose-tunnel-staging-app-db-5432"));
+        assert!(rendered.contains("#   remote_port: 5432"));
+        assert!(rendered.contains("#   local: 127.0.0.1:15432"));
         assert!(rendered.contains("server_db=15432"));
         assert!(rendered.contains("DATABASE_PORT=15432"));
         assert!(rendered.contains("DATABASE_HOST=127.0.0.1"));
@@ -1965,7 +2070,8 @@ mod tests {
             }],
         };
 
-        let rendered = render_env_profile_inner(&profile, &state).expect("profile should render");
+        let rendered =
+            render_env_profile_at(&profile, &state, "2026-07-21 16:30:45").expect("profile should render");
 
         assert!(rendered.contains("server_name_container_name=15432"));
         assert!(rendered.contains("DATABASE_PORT=15432"));
