@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "compose-tunnel"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "compose-tunnel-core",
  "serde",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "compose-tunnel-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -597,11 +597,12 @@ dependencies = [
 
 [[package]]
 name = "compose-tunnel-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "chrono",
  "directories",
+ "glob",
  "portpicker",
  "serde",
  "serde_json",

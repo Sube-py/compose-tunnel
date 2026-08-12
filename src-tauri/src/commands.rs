@@ -8,13 +8,14 @@ use compose_tunnel_core::{
     init_config as core_init_config, list_compose_projects as core_list_compose_projects,
     list_compose_services as core_list_compose_services,
     list_env_profiles as core_list_env_profiles, list_servers as core_list_servers,
-    list_tunnels as core_list_tunnels, load_config, open_tunnel as core_open_tunnel,
-    preview_cleanup as core_preview_cleanup, render_env_profile as core_render_env_profile,
-    save_defaults as core_save_defaults, save_env_profile as core_save_env_profile,
-    save_server as core_save_server, set_active_env_profile as core_set_active_env_profile,
-    test_server as core_test_server, write_env_profile as core_write_env_profile, AppConfig,
-    AppError, AppPaths, CleanupResult, ComposeProject, ComposeService, Defaults, EnvProfileConfig,
-    OpenTunnelRequest, ServerConfig, ServerTestResult, TunnelState, WriteEnvProfileRequest,
+    list_ssh_config_hosts as core_list_ssh_config_hosts, list_tunnels as core_list_tunnels,
+    load_config, open_tunnel as core_open_tunnel, preview_cleanup as core_preview_cleanup,
+    render_env_profile as core_render_env_profile, save_defaults as core_save_defaults,
+    save_env_profile as core_save_env_profile, save_server as core_save_server,
+    set_active_env_profile as core_set_active_env_profile, test_server as core_test_server,
+    write_env_profile as core_write_env_profile, AppConfig, AppError, AppPaths, CleanupResult,
+    ComposeProject, ComposeService, Defaults, EnvProfileConfig, OpenTunnelRequest, ServerConfig,
+    ServerTestResult, SshConfigHost, TunnelState, WriteEnvProfileRequest,
 };
 
 type CommandResult<T> = std::result::Result<T, String>;
@@ -59,13 +60,17 @@ pub async fn save_env_profile(profile: EnvProfileConfig) -> CommandResult<()> {
 }
 
 #[tauri::command]
-pub async fn delete_env_profile(name: String) -> CommandResult<()> {
-    core_delete_env_profile(name).await.map_err(map_error)
+pub async fn delete_env_profile(name: String, target_dir: Option<String>) -> CommandResult<()> {
+    core_delete_env_profile(name, target_dir)
+        .await
+        .map_err(map_error)
 }
 
 #[tauri::command]
-pub async fn set_active_env_profile(name: String) -> CommandResult<()> {
-    core_set_active_env_profile(name).await.map_err(map_error)
+pub async fn set_active_env_profile(name: String, target_dir: Option<String>) -> CommandResult<()> {
+    core_set_active_env_profile(name, target_dir)
+        .await
+        .map_err(map_error)
 }
 
 #[tauri::command]
@@ -79,6 +84,11 @@ pub async fn clear_active_env_profile(target_dir: String) -> CommandResult<Strin
 #[tauri::command]
 pub async fn list_servers() -> CommandResult<Vec<ServerConfig>> {
     core_list_servers().await.map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn list_ssh_config_hosts() -> CommandResult<Vec<SshConfigHost>> {
+    core_list_ssh_config_hosts().await.map_err(map_error)
 }
 
 #[tauri::command]
@@ -134,8 +144,10 @@ pub async fn list_tunnels() -> CommandResult<Vec<TunnelState>> {
 }
 
 #[tauri::command]
-pub async fn render_env_profile(name: String) -> CommandResult<String> {
-    core_render_env_profile(name).await.map_err(map_error)
+pub async fn render_env_profile(name: String, target_dir: Option<String>) -> CommandResult<String> {
+    core_render_env_profile(name, target_dir)
+        .await
+        .map_err(map_error)
 }
 
 #[tauri::command]

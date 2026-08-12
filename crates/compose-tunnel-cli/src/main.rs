@@ -350,14 +350,14 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
             println!("Saved env profile {}", args.name);
         }
         EnvProfileCommand::Show { name } => {
-            print!("{}", render_env_profile(name).await?);
+            print!("{}", render_env_profile(name, None).await?);
         }
         EnvProfileCommand::Use { name } => {
-            set_active_env_profile(name.clone()).await?;
+            set_active_env_profile(name.clone(), None).await?;
             println!("Activated env profile {name}");
         }
         EnvProfileCommand::Write(args) => {
-            let env = render_env_profile(args.name.clone()).await?;
+            let env = render_env_profile(args.name.clone(), None).await?;
             let sensitive_keys = sensitive_env_keys(&env);
             if !sensitive_keys.is_empty()
                 && !args.yes
@@ -366,9 +366,10 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
                 println!("Env profile write cancelled");
                 return Ok(());
             }
-            set_active_env_profile(args.name.clone()).await?;
+            set_active_env_profile(args.name.clone(), None).await?;
             let path = write_env_profile(WriteEnvProfileRequest {
                 name: args.name.clone(),
+                target_dir: None,
             })
             .await?;
             println!("Wrote env profile {} to {}", args.name, path.display());
@@ -383,7 +384,7 @@ async fn handle_env_profile(command: EnvProfileCommand) -> anyhow::Result<()> {
                 println!("Env profile delete cancelled");
                 return Ok(());
             }
-            delete_env_profile(args.name.clone()).await?;
+            delete_env_profile(args.name.clone(), None).await?;
             println!("Deleted env profile {}", args.name);
         }
     }

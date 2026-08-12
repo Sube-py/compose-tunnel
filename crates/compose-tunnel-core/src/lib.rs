@@ -126,6 +126,14 @@ pub struct ServerConfig {
     pub docker_command: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshConfigHost {
+    pub alias: String,
+    pub hostname: String,
+    pub user: String,
+    pub port: u16,
+}
+
 fn default_ssh_port() -> u16 {
     22
 }
@@ -259,6 +267,8 @@ pub struct OpenTunnelRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteEnvProfileRequest {
     pub name: String,
+    #[serde(default)]
+    pub target_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +366,105 @@ pub async fn list_servers() -> Result<Vec<ServerConfig>> {
     Ok(load_config().await?.servers)
 }
 
+pub async fn list_ssh_config_hosts() -> Result<Vec<SshConfigHost>> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(Vec::new());
+    };
+    let aliases = ssh_aliases_from_file(&home.join(".ssh/config"), &home.join(".ssh"))?;
+    let ssh_binary = load_config()
+        .await
+        .map(|config| config.defaults.ssh_binary)
+        .unwrap_or_else(|_| default_ssh_binary());
+    let mut hosts = Vec::new();
+
+    for alias in aliases {
+        let output = Command::new(&ssh_binary)
+            .args(["-G", "--", &alias])
+            .output()
+            .await?;
+        if !output.status.success() {
+            continue;
+        }
+        let resolved = String::from_utf8_lossy(&output.stdout);
+        let hostname = ssh_config_value(&resolved, "hostname").unwrap_or_else(|| alias.clone());
+        let user = ssh_config_value(&resolved, "user").unwrap_or_default();
+        let port = ssh_config_value(&resolved, "port")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(default_ssh_port);
+        hosts.push(SshConfigHost {
+            alias,
+            hostname,
+            user,
+            port,
+        });
+    }
+    Ok(hosts)
+}
+
+fn ssh_aliases_from_file(path: &Path, ssh_dir: &Path) -> Result<Vec<String>> {
+    let mut aliases = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    collect_ssh_aliases(path, ssh_dir, &mut aliases, &mut visited)?;
+    Ok(aliases.into_iter().collect())
+}
+
+fn collect_ssh_aliases(
+    path: &Path,
+    ssh_dir: &Path,
+    aliases: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let path = path.to_path_buf();
+    if !visited.insert(path.clone()) || !path.is_file() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        let Some((keyword, value)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if keyword.eq_ignore_ascii_case("host") {
+            aliases.extend(
+                value
+                    .split_whitespace()
+                    .filter(|alias| !alias.starts_with('!') && !alias.contains(['*', '?']))
+                    .map(str::to_string),
+            );
+        } else if keyword.eq_ignore_ascii_case("include") {
+            for pattern in value.split_whitespace() {
+                let expanded = if let Some(rest) = pattern.strip_prefix("~/") {
+                    ssh_dir.parent().unwrap_or(ssh_dir).join(rest)
+                } else {
+                    let candidate = PathBuf::from(pattern);
+                    if candidate.is_absolute() {
+                        candidate
+                    } else {
+                        ssh_dir.join(candidate)
+                    }
+                };
+                if let Some(pattern) = expanded.to_str() {
+                    for included in
+                        glob::glob(pattern).map_err(|error| AppError::msg(error.to_string()))?
+                    {
+                        if let Ok(included) = included {
+                            collect_ssh_aliases(&included, ssh_dir, aliases, visited)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ssh_config_value(config: &str, key: &str) -> Option<String> {
+    config.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        (parts.next() == Some(key)).then(|| parts.collect::<Vec<_>>().join(" "))
+    })
+}
+
 pub async fn save_server(server: ServerConfig) -> Result<()> {
     validate_name("server name", &server.name)?;
     if server.host.trim().is_empty() {
@@ -416,30 +525,27 @@ pub async fn save_env_profile(profile: EnvProfileConfig) -> Result<()> {
     validate_name("env profile name", &profile.name)?;
     let profile = normalize_env_profile(profile)?;
     let profile_name = profile.name.clone();
+    let target_key = env_profile_target_key(&profile)?;
 
     let mut config = load_config().await?;
-    let was_active = active_env_profiles_for_config(&config)
-        .values()
-        .any(|active_name| active_name == &profile_name);
-    if let Some(existing) = config
-        .env_profiles
-        .iter_mut()
-        .find(|item| item.name == profile_name)
-    {
+    let was_active =
+        active_env_profiles_for_config(&config).get(&target_key) == Some(&profile_name);
+    if let Some(existing) = config.env_profiles.iter_mut().find(|item| {
+        item.name == profile_name
+            && env_profile_target_key(item).is_ok_and(|value| value == target_key)
+    }) {
         *existing = profile;
     } else {
         config.env_profiles.push(profile);
     }
-    config
-        .env_profiles
-        .sort_by(|left, right| left.name.cmp(&right.name));
+    config.env_profiles.sort_by(|left, right| {
+        env_profile_target_key(left)
+            .unwrap_or_default()
+            .cmp(&env_profile_target_key(right).unwrap_or_default())
+            .then_with(|| left.name.cmp(&right.name))
+    });
     config.active_env_profiles = active_env_profiles_for_config(&config);
-    config
-        .active_env_profiles
-        .retain(|_, active_name| active_name != &profile_name);
     if was_active {
-        let saved = find_env_profile(&config, &profile_name)?;
-        let target_key = env_profile_target_key(saved)?;
         config.active_env_profiles.insert(target_key, profile_name);
     }
     config.active_env_profile = None;
@@ -489,20 +595,23 @@ fn normalize_env_profile(mut profile: EnvProfileConfig) -> Result<EnvProfileConf
     Ok(profile)
 }
 
-pub async fn delete_env_profile(name: String) -> Result<()> {
+pub async fn delete_env_profile(name: String, target_dir: Option<String>) -> Result<()> {
     let mut config = load_config().await?;
-    config.env_profiles.retain(|profile| profile.name != name);
+    let profile = find_env_profile(&config, &name, target_dir.as_deref())?;
+    let target_key = env_profile_target_key(profile)?;
+    config.env_profiles.retain(|profile| {
+        !(profile.name == name
+            && env_profile_target_key(profile).is_ok_and(|value| value == target_key))
+    });
     config.active_env_profiles = active_env_profiles_for_config(&config);
-    config
-        .active_env_profiles
-        .retain(|_, active_name| active_name != &name);
+    config.active_env_profiles.remove(&target_key);
     config.active_env_profile = None;
     save_config(&config).await
 }
 
-pub async fn set_active_env_profile(name: String) -> Result<()> {
+pub async fn set_active_env_profile(name: String, target_dir: Option<String>) -> Result<()> {
     let mut config = load_config().await?;
-    let profile = find_env_profile(&config, &name)?;
+    let profile = find_env_profile(&config, &name, target_dir.as_deref())?;
     let target_key = env_profile_target_key(profile)?;
     config.active_env_profiles = active_env_profiles_for_config(&config);
     config.active_env_profiles.insert(target_key, name);
@@ -914,16 +1023,16 @@ fn cleanup_candidates(containers: Vec<String>, state: &AppState, server_id: &str
         .collect()
 }
 
-pub async fn render_env_profile(name: String) -> Result<String> {
+pub async fn render_env_profile(name: String, target_dir: Option<String>) -> Result<String> {
     let config = load_config().await?;
-    let profile = find_env_profile(&config, &name)?;
+    let profile = find_env_profile(&config, &name, target_dir.as_deref())?;
     let state = load_state().await?;
     render_env_profile_inner(profile, &state)
 }
 
 pub async fn write_env_profile(request: WriteEnvProfileRequest) -> Result<PathBuf> {
     let config = load_config().await?;
-    let profile = find_env_profile(&config, &request.name)?;
+    let profile = find_env_profile(&config, &request.name, request.target_dir.as_deref())?;
     let target_key = env_profile_target_key(profile)?;
     let active_profiles = active_env_profiles_for_config(&config);
     if active_profiles.get(&target_key) != Some(&request.name) {
@@ -933,7 +1042,8 @@ pub async fn write_env_profile(request: WriteEnvProfileRequest) -> Result<PathBu
         )));
     }
     let target_dir = env_profile_target_dir(profile)?;
-    let env = render_env_profile(request.name.clone()).await?;
+    let state = load_state().await?;
+    let env = render_env_profile_inner(profile, &state)?;
     let env_file = target_dir.join(".env");
     write_env_profile_block(&env_file, &env).await?;
     Ok(env_file)
@@ -947,23 +1057,42 @@ fn find_server<'a>(config: &'a AppConfig, name: &str) -> Result<&'a ServerConfig
         .ok_or_else(|| AppError::msg(format!("server {name} was not found")))
 }
 
-fn find_env_profile<'a>(config: &'a AppConfig, name: &str) -> Result<&'a EnvProfileConfig> {
-    config
+fn find_env_profile<'a>(
+    config: &'a AppConfig,
+    name: &str,
+    target_dir: Option<&str>,
+) -> Result<&'a EnvProfileConfig> {
+    let target_key = target_dir.map(normalize_target_dir_key).transpose()?;
+    let matches = config
         .env_profiles
         .iter()
-        .find(|profile| profile.name == name)
-        .ok_or_else(|| AppError::msg(format!("env profile {name} was not found")))
+        .filter(|profile| {
+            profile.name == name
+                && target_key.as_ref().is_none_or(|target| {
+                    env_profile_target_key(profile).is_ok_and(|value| &value == target)
+                })
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [profile] => Ok(profile),
+        [] => Err(AppError::msg(format!("env profile {name} was not found"))),
+        _ => Err(AppError::msg(format!(
+            "env profile {name} exists in multiple projects; target directory is required"
+        ))),
+    }
 }
 
 fn active_env_profiles_for_config(config: &AppConfig) -> BTreeMap<String, String> {
     let mut active = BTreeMap::new();
 
-    for active_name in config.active_env_profiles.values() {
-        if let Some(profile) = config
-            .env_profiles
-            .iter()
-            .find(|profile| &profile.name == active_name)
-        {
+    for (stored_target, active_name) in &config.active_env_profiles {
+        let Ok(stored_target) = normalize_target_dir_key(stored_target) else {
+            continue;
+        };
+        if let Some(profile) = config.env_profiles.iter().find(|profile| {
+            &profile.name == active_name
+                && env_profile_target_key(profile).is_ok_and(|value| value == stored_target)
+        }) {
             if let Ok(target_key) = env_profile_target_key(profile) {
                 active.insert(target_key, active_name.clone());
             }
@@ -1656,6 +1785,71 @@ fn now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_profile_names_are_scoped_to_target_directory() {
+        let config = AppConfig {
+            env_profiles: vec![
+                EnvProfileConfig {
+                    name: "test".to_string(),
+                    target_dir: Some(PathBuf::from("/apps/alpha")),
+                    ..EnvProfileConfig::default()
+                },
+                EnvProfileConfig {
+                    name: "test".to_string(),
+                    target_dir: Some(PathBuf::from("/apps/beta")),
+                    ..EnvProfileConfig::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        let alpha = find_env_profile(&config, "test", Some("/apps/alpha"))
+            .expect("project-scoped env should resolve");
+        assert_eq!(alpha.target_dir.as_deref(), Some(Path::new("/apps/alpha")));
+
+        let error = find_env_profile(&config, "test", None)
+            .expect_err("an unscoped duplicate env name should be ambiguous");
+        assert_eq!(
+            error.to_string(),
+            "env profile test exists in multiple projects; target directory is required"
+        );
+    }
+
+    #[test]
+    fn ssh_config_hosts_exclude_patterns_and_follow_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "compose-tunnel-ssh-config-test-{}",
+            std::process::id()
+        ));
+        let ssh_dir = root.join(".ssh");
+        std::fs::create_dir_all(ssh_dir.join("config.d")).expect("ssh test dir should exist");
+        std::fs::write(
+            ssh_dir.join("config"),
+            "Host * !blocked\n  ServerAliveInterval 30\nInclude config.d/*\nHost staging prod\n",
+        )
+        .expect("main ssh config should be written");
+        std::fs::write(
+            ssh_dir.join("config.d/work"),
+            "Host jump-*\nHost bastion # comment\n",
+        )
+        .expect("included ssh config should be written");
+
+        let aliases = ssh_aliases_from_file(&ssh_dir.join("config"), &ssh_dir)
+            .expect("ssh aliases should parse");
+
+        assert_eq!(aliases, vec!["bastion", "prod", "staging"]);
+        std::fs::remove_dir_all(root).expect("ssh test dir should be removed");
+    }
+
+    #[test]
+    fn ssh_config_value_reads_resolved_property() {
+        let config = "host staging\nuser deploy\nhostname 10.0.0.5\nport 2202\n";
+
+        assert_eq!(ssh_config_value(config, "hostname").as_deref(), Some("10.0.0.5"));
+        assert_eq!(ssh_config_value(config, "user").as_deref(), Some("deploy"));
+        assert_eq!(ssh_config_value(config, "port").as_deref(), Some("2202"));
+    }
 
     #[test]
     fn replace_managed_block_keeps_other_content() {

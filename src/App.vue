@@ -14,6 +14,7 @@ import InputNumber from "primevue/inputnumber";
 import InputText from "primevue/inputtext";
 import ScrollPanel from "primevue/scrollpanel";
 import Select from "primevue/select";
+import SelectButton from "primevue/selectbutton";
 import Tag from "primevue/tag";
 import Toast from "primevue/toast";
 import logoUrl from "../assets/logo.svg";
@@ -35,6 +36,13 @@ type ServerConfig = {
   ssh_alias?: string | null;
   default_socat_image?: string | null;
   docker_command: string;
+};
+
+type SshConfigHost = {
+  alias: string;
+  hostname: string;
+  user: string;
+  port: number;
 };
 
 type ComposeProject = {
@@ -131,6 +139,8 @@ const selectedProject = ref("");
 const envPreview = ref("");
 const editingServerName = ref("");
 const serverDialogVisible = ref(false);
+const serverAuthMode = ref<"alias" | "identity">("alias");
+const sshConfigHosts = ref<SshConfigHost[]>([]);
 const tunnelDialogVisible = ref(false);
 const selectedEnvTargetDir = ref("");
 const selectedEnvProfileName = ref("");
@@ -181,6 +191,22 @@ const dockerModeOptions = [
   { label: "sudo -n docker", value: "sudo -n docker" },
   { label: "custom", value: "custom" },
 ];
+const serverAuthOptions = [
+  { label: "SSH config alias", value: "alias", icon: "pi pi-list" },
+  { label: "Identity file", value: "identity", icon: "pi pi-key" },
+];
+const sshAliasOptions = computed(() => {
+  const options = sshConfigHosts.value.map((host) => ({
+    label: host.alias,
+    value: host.alias,
+    detail: `${host.user ? `${host.user}@` : ""}${host.hostname}:${host.port}`,
+  }));
+  const current = serverForm.ssh_alias?.trim();
+  if (current && !options.some((option) => option.value === current)) {
+    options.unshift({ label: current, value: current, detail: "Saved alias (not found in ~/.ssh/config)" });
+  }
+  return options;
+});
 const serverOptions = computed(() => servers.value.map((server) => ({ label: server.name, value: server.name })));
 const tunnelServerFilterOptions = computed(() => [
   { label: "All", value: "all" },
@@ -327,6 +353,10 @@ async function refreshServers() {
   }
 }
 
+async function refreshSshConfigHosts() {
+  sshConfigHosts.value = await invoke<SshConfigHost[]>("list_ssh_config_hosts");
+}
+
 async function refreshTunnels() {
   tunnels.value = await invoke<TunnelState[]>("list_tunnels");
 }
@@ -354,12 +384,25 @@ async function refreshEnvProfiles() {
   if (!selectedEnvTargetDir.value && envProfiles.value.length > 0) {
     selectedEnvTargetDir.value = envTargetKey(envProfiles.value[0]);
   }
-  if (selectedEnvProfileName.value && envProfiles.value.some((profile) => profile.name === selectedEnvProfileName.value)) {
-    loadEnvProfile(selectedEnvProfileName.value);
+  if (
+    selectedEnvProfileName.value &&
+    envProfiles.value.some(
+      (profile) => profile.name === selectedEnvProfileName.value && envTargetKey(profile) === selectedEnvTargetDir.value,
+    )
+  ) {
+    loadEnvProfile(selectedEnvProfileName.value, selectedEnvTargetDir.value);
   }
 }
 
 async function saveServer() {
+  if (serverAuthMode.value === "alias" && !serverForm.ssh_alias?.trim()) {
+    toast.add({ severity: "warn", summary: "Select an SSH config alias", life: 3000 });
+    return;
+  }
+  if (serverAuthMode.value === "identity" && !serverForm.identity_file?.trim()) {
+    toast.add({ severity: "warn", summary: "Choose an SSH identity file", life: 3000 });
+    return;
+  }
   await runTask(
     `Saved server ${serverForm.name}`,
     async () => {
@@ -440,12 +483,46 @@ function editServer(server: ServerConfig) {
     default_socat_image: server.default_socat_image ?? "",
     docker_command: server.docker_command || "docker",
   });
+  serverAuthMode.value = server.ssh_alias ? "alias" : "identity";
+  void refreshSshConfigHosts();
   serverDialogVisible.value = true;
 }
 
 function openNewServerDialog() {
   clearServerForm();
+  serverAuthMode.value = "alias";
+  void refreshSshConfigHosts();
   serverDialogVisible.value = true;
+}
+
+async function chooseIdentityFile() {
+  const selected = await open({ multiple: false, title: "Select SSH private key" });
+  if (typeof selected === "string") {
+    serverForm.identity_file = selected;
+  }
+}
+
+function onServerAuthModeChange(mode: "alias" | "identity") {
+  serverAuthMode.value = mode;
+  if (mode === "alias") {
+    serverForm.identity_file = "";
+  } else {
+    serverForm.ssh_alias = "";
+  }
+}
+
+function onSshAliasChange(alias: string | null) {
+  serverForm.ssh_alias = alias ?? "";
+  if (!alias) {
+    return;
+  }
+  const host = sshConfigHosts.value.find((item) => item.alias === alias);
+  serverForm.name = alias;
+  if (host) {
+    serverForm.host = host.hostname;
+    serverForm.user = host.user;
+    serverForm.port = host.port;
+  }
 }
 
 function applyDockerCommandPreset(value: string) {
@@ -761,18 +838,20 @@ function newEnvProfileInDialog() {
 }
 
 function openEditEnvDialog(profile: EnvProfileConfig) {
-  loadEnvProfile(profile.name);
+  loadEnvProfile(profile.name, envTargetKey(profile));
   envDialogVisible.value = true;
 }
 
 function switchEnvProfileInDialog(name: string | null) {
   if (name) {
-    loadEnvProfile(name);
+    loadEnvProfile(name, envProfileForm.target_dir?.trim() || selectedEnvTargetDir.value);
   }
 }
 
-function loadEnvProfile(name: string) {
-  const profile = envProfiles.value.find((item) => item.name === name);
+function loadEnvProfile(name: string, targetDir = selectedEnvTargetDir.value) {
+  const profile = envProfiles.value.find(
+    (item) => item.name === name && envTargetKey(item) === targetDir,
+  );
   if (!profile) {
     newEnvProfile();
     return;
@@ -817,28 +896,36 @@ async function saveEnvProfile(showToast = true, closeDialog = false) {
   const profile = compactEnvProfile();
   const originalName = editingEnvProfileName.value;
   const isRename = Boolean(originalName) && originalName !== profile.name;
-  const nameExists = envProfiles.value.some((item) => item.name === profile.name && item.name !== originalName);
+  const target = envTargetKey(profile);
+  const nameExists = envProfiles.value.some(
+    (item) =>
+      envTargetKey(item) === target &&
+      item.name === profile.name &&
+      item.name !== originalName,
+  );
   if (nameExists) {
     toast.add({ severity: "warn", summary: `Env ${profile.name} already exists`, life: 3000 });
     return false;
   }
-  const originalProfile = originalName ? envProfiles.value.find((item) => item.name === originalName) : null;
+  const originalProfile = originalName
+    ? envProfiles.value.find((item) => item.name === originalName && envTargetKey(item) === target)
+    : null;
   const wasActive = originalProfile ? isActiveEnvProfile(originalProfile) : false;
   const result = await runTask(
     `Saved env ${profile.name}`,
     async () => {
       if (isRename) {
-        await invoke("delete_env_profile", { name: originalName });
+        await invoke("delete_env_profile", { name: originalName, targetDir: target });
       }
       await invoke("save_env_profile", { profile });
       if (wasActive) {
-        await invoke("set_active_env_profile", { name: profile.name });
+        await invoke("set_active_env_profile", { name: profile.name, targetDir: target });
       }
       await refreshEnvProfiles();
       selectedEnvTargetDir.value = envTargetKey(profile);
       selectedEnvProfileName.value = profile.name;
       editingEnvProfileName.value = profile.name;
-      loadEnvProfile(profile.name);
+      loadEnvProfile(profile.name, target);
       if (closeDialog) {
         envDialogVisible.value = false;
       }
@@ -851,6 +938,7 @@ async function saveEnvProfile(showToast = true, closeDialog = false) {
 
 async function deleteEnvProfile(profile?: EnvProfileConfig) {
   const name = profile?.name ?? selectedEnvProfileName.value;
+  const targetDir = profile ? envTargetKey(profile) : selectedEnvTargetDir.value;
   if (!name) {
     toast.add({ severity: "warn", summary: "Select an env first", life: 3000 });
     return;
@@ -869,16 +957,16 @@ async function deleteEnvProfile(profile?: EnvProfileConfig) {
       severity: "danger",
     },
     accept: () => {
-      void runDeleteEnvProfile(name);
+      void runDeleteEnvProfile(name, targetDir);
     },
   });
 }
 
-async function runDeleteEnvProfile(name: string) {
+async function runDeleteEnvProfile(name: string, targetDir: string) {
   await runTask(
     `Deleted env ${name}`,
     async () => {
-      await invoke("delete_env_profile", { name });
+      await invoke("delete_env_profile", { name, targetDir });
       if (selectedEnvProfileName.value === name) {
         newEnvProfile();
         envDialogVisible.value = false;
@@ -919,12 +1007,16 @@ function selectEnvForProject(project: EnvProjectRow, name: string | null) {
 
 function activeProfileForProject(project: EnvProjectRow) {
   const activeName = activeEnvProfiles.value[project.target_dir] ?? "";
-  return envProfiles.value.find((profile) => profile.name === activeName) ?? null;
+  return envProfiles.value.find(
+    (profile) => profile.name === activeName && envTargetKey(profile) === project.target_dir,
+  ) ?? null;
 }
 
 function selectedProfileForProject(project: EnvProjectRow) {
   const selectedName = selectedEnvNames.value[project.target_dir] || project.selected_name || project.active_name;
-  return envProfiles.value.find((profile) => profile.name === selectedName) ?? activeProfileForProject(project) ?? profilesForProject(project)[0] ?? null;
+  return envProfiles.value.find(
+    (profile) => profile.name === selectedName && envTargetKey(profile) === project.target_dir,
+  ) ?? activeProfileForProject(project) ?? profilesForProject(project)[0] ?? null;
 }
 
 function openEditProjectEnv(project: EnvProjectRow) {
@@ -1030,13 +1122,14 @@ async function runEnableProjectEnv(profile: EnvProfileConfig) {
         }
       }
       await refreshTunnels();
-      await invoke("set_active_env_profile", { name: profile.name });
+      const targetDir = envTargetKey(profile);
+      await invoke("set_active_env_profile", { name: profile.name, targetDir });
       const path = await invoke<string>("write_env_profile", {
-        request: { name: profile.name },
+        request: { name: profile.name, target_dir: targetDir },
       });
       await refreshEnvProfiles();
       selectedEnvNames.value[envTargetKey(profile)] = profile.name;
-      envPreview.value = await invoke<string>("render_env_profile", { name: profile.name });
+      envPreview.value = await invoke<string>("render_env_profile", { name: profile.name, targetDir });
       toast.add({ severity: "info", summary: "Updated .env", detail: path, life: 4500 });
     },
     false,
@@ -1107,16 +1200,18 @@ function removeExtraEnv(index: number) {
 
 async function renderEnvProfilePreview(profile?: EnvProfileConfig) {
   let name = profile?.name ?? envProfileForm.name.trim();
+  let targetDir = profile ? envTargetKey(profile) : envTargetKey(envProfileForm);
   if (!profile) {
     const saved = await saveEnvProfile(false);
     if (!saved) {
       return;
     }
     name = envProfileForm.name.trim();
+    targetDir = envTargetKey(envProfileForm);
   }
   const result = await runTask(
     `Rendered env ${name}`,
-    async () => invoke<string>("render_env_profile", { name }),
+    async () => invoke<string>("render_env_profile", { name, targetDir }),
     true,
     `env:preview:${name}`,
   );
@@ -1178,8 +1273,8 @@ function compactServer(server: ServerConfig): ServerConfig {
     host: server.host.trim(),
     port: Number(server.port),
     user: server.user.trim(),
-    identity_file: optional(server.identity_file),
-    ssh_alias: optional(server.ssh_alias),
+    identity_file: serverAuthMode.value === "identity" ? optional(server.identity_file) : null,
+    ssh_alias: serverAuthMode.value === "alias" ? optional(server.ssh_alias) : null,
     default_socat_image: optional(server.default_socat_image),
     docker_command: server.docker_command.trim() || "docker",
   };
@@ -1319,18 +1414,56 @@ onMounted(bootstrap);
         <Dialog v-model:visible="serverDialogVisible" modal :header="editingServerName ? `Edit ${editingServerName}` : 'Add Server'" class="entity-dialog">
           <form class="form dialog-stack" @submit.prevent="saveServer">
             <div class="dialog-grid">
-              <label>Name<InputText v-model="serverForm.name" required /></label>
-              <label>Host<InputText v-model="serverForm.host" required /></label>
-              <label>User<InputText v-model="serverForm.user" required /></label>
+              <label class="dialog-grid-wide">
+                Authentication
+                <SelectButton
+                  :modelValue="serverAuthMode"
+                  :options="serverAuthOptions"
+                  optionLabel="label"
+                  optionValue="value"
+                  :allowEmpty="false"
+                  @update:modelValue="onServerAuthModeChange"
+                >
+                  <template #option="{ option }"><i :class="option.icon" /><span>{{ option.label }}</span></template>
+                </SelectButton>
+              </label>
+              <label v-if="serverAuthMode === 'alias'" class="dialog-grid-wide">
+                SSH config alias
+                <div class="inline-field">
+                  <Select
+                    :modelValue="serverForm.ssh_alias"
+                    :options="sshAliasOptions"
+                    optionLabel="label"
+                    optionValue="value"
+                    placeholder="Select an alias from ~/.ssh/config"
+                    filter
+                    @update:modelValue="onSshAliasChange"
+                  >
+                    <template #option="{ option }">
+                      <div class="ssh-alias-option"><strong>{{ option.label }}</strong><small>{{ option.detail }}</small></div>
+                    </template>
+                  </Select>
+                  <Button icon="pi pi-refresh" type="button" severity="secondary" outlined aria-label="Reload SSH aliases" title="Reload SSH aliases" @click="refreshSshConfigHosts" />
+                </div>
+                <small v-if="sshConfigHosts.length === 0" class="subtle">No concrete Host entries found in ~/.ssh/config.</small>
+              </label>
+              <label v-else class="dialog-grid-wide">
+                Identity file
+                <div class="inline-field identity-picker">
+                  <InputText :modelValue="serverForm.identity_file || ''" placeholder="No private key selected" readonly />
+                  <Button label="Choose key" icon="pi pi-folder-open" type="button" severity="secondary" outlined @click="chooseIdentityFile" />
+                </div>
+              </label>
+              <label>Name<InputText v-model="serverForm.name" autocapitalize="off" autocorrect="off" spellcheck="false" required /></label>
+              <label>Host<InputText v-model="serverForm.host" autocapitalize="off" autocorrect="off" spellcheck="false" required /></label>
+              <label>User<InputText v-model="serverForm.user" autocapitalize="off" autocorrect="off" spellcheck="false" required /></label>
               <label>Port<InputNumber v-model="serverForm.port" :min="1" :useGrouping="false" fluid /></label>
-              <label>Identity file<InputText v-model="serverForm.identity_file" placeholder="~/.ssh/id_ed25519" /></label>
-              <label>SSH config alias<InputText v-model="serverForm.ssh_alias" placeholder="staging" /></label>
               <label>
                 Docker mode
                 <Select :modelValue="dockerCommandPreset" :options="dockerModeOptions" optionLabel="label" optionValue="value" @update:modelValue="onDockerModeChange" />
               </label>
-              <label>Docker command<InputText v-model="serverForm.docker_command" required /></label>
-              <label>Default socat image<InputText v-model="serverForm.default_socat_image" placeholder="alpine/socat:latest" /></label>
+              <label>Docker command<InputText v-model="serverForm.docker_command" autocapitalize="off" autocorrect="off" spellcheck="false" required /></label>
+              <label>Default socat image<InputText v-model="serverForm.default_socat_image" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="alpine/socat:latest" /></label>
             </div>
             <div class="dialog-actions">
               <Button label="Cancel" severity="secondary" outlined type="button" :disabled="isBusy('server:save')" @click="serverDialogVisible = false" />

@@ -17,6 +17,7 @@ pub fn run() {
             commands::set_active_env_profile,
             commands::clear_active_env_profile,
             commands::list_servers,
+            commands::list_ssh_config_hosts,
             commands::save_server,
             commands::delete_server,
             commands::test_server,
