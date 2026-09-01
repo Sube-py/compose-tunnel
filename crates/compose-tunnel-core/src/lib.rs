@@ -830,14 +830,16 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         .local_host
         .clone()
         .unwrap_or_else(|| config.defaults.local_host.clone());
-    let local_port = match request.local_port {
-        Some(port) => {
-            ensure_local_port_available(&local_host, port)?;
-            port
-        }
-        None => portpicker::pick_unused_port()
-            .ok_or_else(|| AppError::msg("could not find an available local port"))?,
-    };
+    let existing_state = load_state().await?;
+    let tunnel_id = tunnel_state_id(
+        &existing_state,
+        &request.server,
+        &request.project,
+        &request.service,
+        request.target_port,
+    );
+    let local_port =
+        resolve_local_port(&existing_state, &tunnel_id, &local_host, request.local_port)?;
     let image = request
         .socat_image
         .clone()
@@ -845,14 +847,6 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         .unwrap_or_else(|| config.defaults.socat_image.clone());
     let container = tunnel_container_name(
         &server.name,
-        &request.project,
-        &request.service,
-        request.target_port,
-    );
-    let existing_state = load_state().await?;
-    let tunnel_id = tunnel_state_id(
-        &existing_state,
-        &request.server,
         &request.project,
         &request.service,
         request.target_port,
@@ -1362,6 +1356,32 @@ fn ensure_local_port_available(host: &str, port: u16) -> Result<()> {
     TcpListener::bind((host, port))
         .map(|_| ())
         .map_err(|error| AppError::msg(format!("local port {host}:{port} is unavailable: {error}")))
+}
+
+fn local_port_available(host: &str, port: u16) -> bool {
+    TcpListener::bind((host, port)).is_ok()
+}
+
+fn resolve_local_port(
+    state: &AppState,
+    tunnel_id: &str,
+    host: &str,
+    requested: Option<u16>,
+) -> Result<u16> {
+    match requested {
+        Some(port) => {
+            ensure_local_port_available(host, port)?;
+            Ok(port)
+        }
+        None => state
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == tunnel_id)
+            .map(|tunnel| tunnel.local_port)
+            .filter(|port| local_port_available(host, *port))
+            .or_else(portpicker::pick_unused_port)
+            .ok_or_else(|| AppError::msg("could not find an available local port")),
+    }
 }
 
 fn tunnel_container_name(server: &str, project: &str, service: &str, target_port: u16) -> String {
@@ -2146,6 +2166,72 @@ mod tests {
             tunnel_state_id(&state, "staging", "billing", "db", 5432),
             "staging-billing-db-5432"
         );
+    }
+
+    fn stopped_tunnel_with_local_port(id: &str, local_port: u16) -> TunnelState {
+        TunnelState {
+            id: id.to_string(),
+            server: "staging".to_string(),
+            project: "app".to_string(),
+            service: "db".to_string(),
+            network: "app_default".to_string(),
+            target_port: 5432,
+            socat_port: 5432,
+            local_host: "127.0.0.1".to_string(),
+            local_port,
+            socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
+            socat_container_ip: "172.18.0.20".to_string(),
+            ssh_pid: None,
+            status: TunnelStatus::Stopped,
+            mode: TunnelMode::SocatDirect,
+            started_at: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn local_port_is_reused_when_previous_port_is_available() {
+        let ephemeral = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
+        let port = ephemeral
+            .local_addr()
+            .expect("local address should resolve")
+            .port();
+        drop(ephemeral);
+        let state = AppState {
+            tunnels: vec![stopped_tunnel_with_local_port("db", port)],
+        };
+
+        let resolved =
+            resolve_local_port(&state, "db", "127.0.0.1", None).expect("local port should resolve");
+
+        assert_eq!(resolved, port);
+    }
+
+    #[test]
+    fn local_port_falls_back_to_a_new_port_when_previous_port_is_occupied() {
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
+        let port = occupied
+            .local_addr()
+            .expect("local address should resolve")
+            .port();
+        let state = AppState {
+            tunnels: vec![stopped_tunnel_with_local_port("db", port)],
+        };
+
+        let resolved =
+            resolve_local_port(&state, "db", "127.0.0.1", None).expect("local port should resolve");
+
+        assert_ne!(resolved, port);
+    }
+
+    #[test]
+    fn local_port_is_assigned_automatically_without_a_previous_tunnel() {
+        let state = AppState::default();
+
+        let resolved =
+            resolve_local_port(&state, "db", "127.0.0.1", None).expect("local port should resolve");
+
+        assert!(resolved > 0);
     }
 
     #[test]
