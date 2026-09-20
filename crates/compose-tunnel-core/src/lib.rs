@@ -1772,6 +1772,12 @@ enum ReconcileDecision {
     Restart,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconcileReport {
+    changed: bool,
+    spawned_pids: Vec<u32>,
+}
+
 fn reconciliation_decision(
     tunnel: &TunnelState,
     inspected: &InspectedContainer,
@@ -1815,14 +1821,27 @@ async fn terminate_and_mark_reconciliation_error(
 async fn load_refreshed_state() -> Result<AppState> {
     let config = load_config().await?;
     let mut state = load_state().await?;
-    if reconcile_tunnels(&config, &mut state).await {
-        save_state(&state).await?;
+    let report = reconcile_tunnels(&config, &mut state).await;
+    if report.changed {
+        let saved = save_state(&state).await;
+        finalize_refresh_save(saved, &report.spawned_pids).await?;
     }
     Ok(state)
 }
 
-async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> bool {
+async fn finalize_refresh_save(save_result: Result<()>, spawned_pids: &[u32]) -> Result<()> {
+    let Err(error) = save_result else {
+        return Ok(());
+    };
+    for pid in spawned_pids {
+        let _ = kill_pid(*pid).await;
+    }
+    Err(error)
+}
+
+async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> ReconcileReport {
     let mut changed = false;
+    let mut spawned_pids = Vec::new();
 
     for tunnel in &mut state.tunnels {
         if tunnel.status == TunnelStatus::Stopped {
@@ -1886,9 +1905,13 @@ async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> bool {
                 .await
                 {
                     Ok(child) => {
+                        let ssh_pid = child.id();
+                        if let Some(pid) = ssh_pid {
+                            spawned_pids.push(pid);
+                        }
                         tunnel.container_id = inspected.id;
                         tunnel.container_ip = inspected.ip;
-                        tunnel.ssh_pid = child.id();
+                        tunnel.ssh_pid = ssh_pid;
                         tunnel.status = TunnelStatus::Running;
                         tunnel.started_at = Some(now_string());
                         tunnel.last_error = None;
@@ -1902,7 +1925,10 @@ async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> bool {
         }
     }
 
-    changed
+    ReconcileReport {
+        changed,
+        spawned_pids,
+    }
 }
 
 fn pid_is_running(pid: u32) -> bool {
@@ -2337,6 +2363,41 @@ mod tests {
             tunnel.last_error.as_deref(),
             Some("container app-db-1 is not running")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_save_failure_terminates_forwards_spawned_in_the_same_pass() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a long-running child");
+        let pid = child.id().expect("spawned child should have a pid");
+
+        let result = finalize_refresh_save(Err(AppError::msg("state write failed")), &[pid]).await;
+
+        let mut exited = false;
+        for _ in 0..100 {
+            if child.try_wait().expect("try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        if !exited {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+
+        assert!(
+            exited,
+            "a forward spawned during the failed refresh must be terminated, not left holding its port"
+        );
+        let error = result.expect_err("the original save error must be returned");
+        assert_eq!(error.to_string(), "state write failed");
     }
 
     #[test]
