@@ -435,6 +435,15 @@ nav {
   grid-column: 1 / -1;
 }
 
+.dialog-grid > label {
+  min-width: 0;
+}
+
+.dialog-grid .p-select {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .dialog-grid .p-selectbutton {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
