@@ -24,6 +24,7 @@ import {
   resolveServerAfterRefresh,
   servicesFor,
   suggestNetwork,
+  withErrorTooltip,
   type ComposeService,
   type ServiceSource,
 } from "./tunnel-target";
@@ -1481,7 +1482,7 @@ onMounted(bootstrap);
             </Column>
             <Column header="Remote" style="width: 42%">
               <template #body="{ data }">
-                <span v-tooltip.top="tunnelRemoteLabel(data)" class="cell-ellipsis">{{ tunnelRemoteLabel(data) }}</span>
+                <span v-tooltip.top="withErrorTooltip(tunnelRemoteLabel(data), data.last_error)" class="cell-ellipsis">{{ tunnelRemoteLabel(data) }}</span>
               </template>
             </Column>
             <Column header="Local" style="width: 18%">

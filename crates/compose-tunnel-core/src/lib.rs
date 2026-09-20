@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::ErrorKind,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -11,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     process::{Child, Command},
+    sync::{Mutex, MutexGuard},
     time,
 };
 
@@ -308,8 +311,7 @@ pub fn app_paths() -> Result<AppPaths> {
 
 pub async fn init_config() -> Result<AppPaths> {
     let paths = app_paths()?;
-    fs::create_dir_all(&paths.config_dir).await?;
-    fs::create_dir_all(&paths.logs_dir).await?;
+    init_dirs(&paths).await?;
     if !paths.config_file.exists() {
         save_config(&AppConfig::default()).await?;
     }
@@ -319,22 +321,68 @@ pub async fn init_config() -> Result<AppPaths> {
     Ok(paths)
 }
 
+async fn init_dirs(paths: &AppPaths) -> Result<()> {
+    fs::create_dir_all(&paths.config_dir).await?;
+    fs::create_dir_all(&paths.logs_dir).await?;
+    Ok(())
+}
+
 pub async fn load_config() -> Result<AppConfig> {
-    let paths = init_config().await?;
-    let raw = fs::read_to_string(paths.config_file).await?;
+    load_config_at(&app_paths()?.config_file).await
+}
+
+async fn load_config_at(config_file: &Path) -> Result<AppConfig> {
+    let raw = match fs::read_to_string(config_file).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let config = AppConfig::default();
+            save_config_at(config_file, &config).await?;
+            return Ok(config);
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok(toml::from_str(&raw)?)
 }
 
 pub async fn save_config(config: &AppConfig) -> Result<()> {
-    let paths = app_paths()?;
-    fs::create_dir_all(&paths.config_dir).await?;
-    fs::write(&paths.config_file, toml::to_string_pretty(config)?).await?;
+    save_config_at(&app_paths()?.config_file, config).await
+}
+
+async fn save_config_at(config_file: &Path, config: &AppConfig) -> Result<()> {
+    ensure_parent_dir(config_file).await?;
+    fs::write(config_file, toml::to_string_pretty(config)?).await?;
     Ok(())
 }
 
+/// Serializes every state-file transaction in this process.
+///
+/// Tokio mutexes are not reentrant, so the locked helpers (`*_locked` and the
+/// transaction functions that take the guard) must never call a public wrapper
+/// that acquires this lock again.
+static STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+async fn lock_state() -> MutexGuard<'static, ()> {
+    STATE_LOCK.lock().await
+}
+
 pub async fn load_state() -> Result<AppState> {
-    let paths = init_config().await?;
-    let raw = fs::read_to_string(paths.state_file).await?;
+    let _guard = lock_state().await;
+    load_state_unlocked(&app_paths()?.state_file).await
+}
+
+/// Reads, migrates, and persists the state file.
+///
+/// The caller must hold the state transaction lock.
+async fn load_state_unlocked(state_file: &Path) -> Result<AppState> {
+    let raw = match fs::read_to_string(state_file).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let state = AppState::default();
+            save_state_unlocked(state_file, &state).await?;
+            return Ok(state);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let migration = parse_stored_state(&raw)?;
     for pid in &migration.legacy_pids {
         if pid_is_running(*pid) {
@@ -342,9 +390,30 @@ pub async fn load_state() -> Result<AppState> {
         }
     }
     if migration.changed {
-        save_state(&migration.state).await?;
+        save_state_unlocked(state_file, &migration.state).await?;
     }
     Ok(migration.state)
+}
+
+pub async fn save_state(state: &AppState) -> Result<()> {
+    let _guard = lock_state().await;
+    save_state_unlocked(&app_paths()?.state_file, state).await
+}
+
+/// Writes the state file.
+///
+/// The caller must hold the state transaction lock.
+async fn save_state_unlocked(state_file: &Path, state: &AppState) -> Result<()> {
+    ensure_parent_dir(state_file).await?;
+    fs::write(state_file, serde_json::to_string_pretty(state)?).await?;
+    Ok(())
+}
+
+async fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    Ok(())
 }
 
 fn parse_stored_state(raw: &str) -> Result<StateMigration> {
@@ -376,14 +445,6 @@ fn parse_stored_state(raw: &str) -> Result<StateMigration> {
         legacy_pids,
         changed,
     })
-}
-
-pub async fn save_state(state: &AppState) -> Result<()> {
-    let paths = app_paths()?;
-    fs::create_dir_all(&paths.config_dir).await?;
-    let raw = serde_json::to_string_pretty(state)?;
-    fs::write(&paths.state_file, raw).await?;
-    Ok(())
 }
 
 pub async fn list_servers() -> Result<Vec<ServerConfig>> {
@@ -873,9 +934,15 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         .local_host
         .clone()
         .unwrap_or_else(|| config.defaults.local_host.clone());
-    let existing_state = load_state().await?;
+    let state_file = app_paths()?.state_file;
+
+    // Everything from here on changes the state file or the local SSH process
+    // that the state file points at: hold the transaction lock so a long
+    // refresh cannot release, replace, or resurrect this tunnel behind us.
+    let _guard = lock_state().await;
+    let mut state = load_state_unlocked(&state_file).await?;
     let tunnel_id = tunnel_state_id(
-        &existing_state,
+        &state,
         &request.server,
         &request.project,
         &request.service,
@@ -883,16 +950,11 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         request.target_port,
     );
 
-    if let Some(previous) = existing_state
-        .tunnels
-        .iter()
-        .find(|tunnel| tunnel.id == tunnel_id)
-    {
+    if let Some(previous) = state.tunnels.iter().find(|tunnel| tunnel.id == tunnel_id) {
         release_previous_tunnel(previous).await?;
     }
 
-    let local_port =
-        resolve_local_port(&existing_state, &tunnel_id, &local_host, request.local_port)?;
+    let local_port = resolve_local_port(&state, &tunnel_id, &local_host, request.local_port)?;
     let child = spawn_ssh_forward(
         &config.defaults,
         &server,
@@ -904,7 +966,7 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
     .await?;
     let ssh_pid = child.id();
 
-    let state = TunnelState {
+    let tunnel = TunnelState {
         id: tunnel_id,
         server: request.server.clone(),
         project: request.project.clone(),
@@ -923,42 +985,64 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         last_error: None,
     };
 
-    if let Err(error) = upsert_tunnel_state(state.clone()).await {
+    upsert_tunnel(&mut state, tunnel.clone());
+    if let Err(error) = save_state_unlocked(&state_file, &state).await {
         if let Some(pid) = ssh_pid {
             let _ = kill_pid(pid).await;
         }
         return Err(error);
     }
-    Ok(state)
+    Ok(tunnel)
 }
 
 pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
-    let mut state = load_state().await?;
-    let mut changed = false;
+    close_tunnel_at(&app_paths()?.state_file, &tunnel_id).await
+}
+
+async fn close_tunnel_at(state_file: &Path, tunnel_id: &str) -> Result<()> {
+    let _guard = lock_state().await;
+    let mut state = load_state_unlocked(state_file).await?;
+    let mut found = false;
 
     for tunnel in &mut state.tunnels {
         if tunnel.id != tunnel_id {
             continue;
         }
+        found = true;
         if let Some(pid) = tunnel.ssh_pid {
             kill_pid(pid).await?;
         }
         tunnel.status = TunnelStatus::Stopped;
         tunnel.ssh_pid = None;
-        changed = true;
     }
 
-    if !changed {
+    if !found {
         return Err(AppError::msg(format!("tunnel {tunnel_id} was not found")));
     }
 
-    save_state(&state).await
+    save_state_unlocked(state_file, &state).await
 }
 
 pub async fn close_all_tunnels() -> Result<()> {
-    let tunnels = load_state().await?.tunnels;
-    for tunnel in tunnels {
-        let _ = close_tunnel(tunnel.id).await;
+    close_all_tunnels_at(&app_paths()?.state_file).await
+}
+
+async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
+    let _guard = lock_state().await;
+    let mut state = load_state_unlocked(state_file).await?;
+    let mut changed = false;
+
+    for tunnel in &mut state.tunnels {
+        if let Some(pid) = tunnel.ssh_pid {
+            let _ = kill_pid(pid).await;
+        }
+        changed |= tunnel.status != TunnelStatus::Stopped || tunnel.ssh_pid.is_some();
+        tunnel.status = TunnelStatus::Stopped;
+        tunnel.ssh_pid = None;
+    }
+
+    if changed {
+        save_state_unlocked(state_file, &state).await?;
     }
     Ok(())
 }
@@ -1254,13 +1338,21 @@ async fn spawn_ssh_forward(
         .spawn()?;
 
     time::sleep(Duration::from_millis(250)).await;
-    if let Some(status) = child.try_wait()? {
-        return Err(AppError::msg(format!(
+    match child.try_wait() {
+        Ok(Some(status)) => Err(AppError::msg(format!(
             "ssh forward exited during startup with status {status}"
-        )));
+        ))),
+        Ok(None) => Ok(child),
+        Err(error) => {
+            // The child state is unknown, so it may still be forwarding: kill
+            // and reap it instead of dropping a live SSH process.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(AppError::msg(format!(
+                "ssh forward could not be checked during startup: {error}"
+            )))
+        }
     }
-
-    Ok(child)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1753,15 +1845,13 @@ fn is_env_profile_block_id(block_id: &str) -> bool {
     block_id == "env" || block_id.starts_with("env:")
 }
 
-async fn upsert_tunnel_state(tunnel: TunnelState) -> Result<()> {
-    let mut state = load_state().await?;
+fn upsert_tunnel(state: &mut AppState, tunnel: TunnelState) {
     if let Some(existing) = state.tunnels.iter_mut().find(|item| item.id == tunnel.id) {
         *existing = tunnel;
     } else {
         state.tunnels.push(tunnel);
     }
     state.tunnels.sort_by(|left, right| left.id.cmp(&right.id));
-    save_state(&state).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1819,11 +1909,22 @@ async fn terminate_and_mark_reconciliation_error(
 }
 
 async fn load_refreshed_state() -> Result<AppState> {
-    let config = load_config().await?;
-    let mut state = load_state().await?;
+    let paths = app_paths()?;
+    refresh_state_at(&paths.config_file, &paths.state_file).await
+}
+
+/// Reconciles every desired tunnel and persists the result once.
+///
+/// The lock is held for the whole reconciliation so a slow refresh can neither
+/// overwrite a concurrent open or close nor orphan the SSH processes it
+/// replaces.
+async fn refresh_state_at(config_file: &Path, state_file: &Path) -> Result<AppState> {
+    let config = load_config_at(config_file).await?;
+    let _guard = lock_state().await;
+    let mut state = load_state_unlocked(state_file).await?;
     let report = reconcile_tunnels(&config, &mut state).await;
     if report.changed {
-        let saved = save_state(&state).await;
+        let saved = save_state_unlocked(state_file, &state).await;
         finalize_refresh_save(saved, &report.spawned_pids).await?;
     }
     Ok(state)
@@ -2021,6 +2122,10 @@ fn now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn direct_tunnel(status: TunnelStatus) -> TunnelState {
         TunnelState {
@@ -2398,6 +2503,222 @@ mod tests {
         );
         let error = result.expect_err("the original save error must be returned");
         assert_eq!(error.to_string(), "state write failed");
+    }
+
+    /// An isolated config/state directory so state transactions can be tested
+    /// without touching the real user profile.
+    struct TempApp {
+        dir: PathBuf,
+        config_file: PathBuf,
+        state_file: PathBuf,
+    }
+
+    impl TempApp {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!(
+                "compose-tunnel-core-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir should be created");
+            Self {
+                config_file: dir.join("config.toml"),
+                state_file: dir.join("state.json"),
+                dir,
+            }
+        }
+
+        fn write_state(&self, state: &AppState) {
+            std::fs::write(
+                &self.state_file,
+                serde_json::to_string_pretty(state).expect("state should serialize"),
+            )
+            .expect("state file should be written");
+        }
+
+        fn read_state(&self) -> AppState {
+            let raw = std::fs::read_to_string(&self.state_file).expect("state file should exist");
+            serde_json::from_str(&raw).expect("state file should parse")
+        }
+    }
+
+    impl Drop for TempApp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn staging_config(ssh_binary: &str) -> AppConfig {
+        AppConfig {
+            defaults: Defaults {
+                local_host: "127.0.0.1".to_string(),
+                ssh_binary: ssh_binary.to_string(),
+                docker_timeout_secs: 10,
+            },
+            servers: vec![ServerConfig {
+                name: "staging".to_string(),
+                host: "staging.example.com".to_string(),
+                port: 22,
+                user: "deploy".to_string(),
+                identity_file: None,
+                ssh_alias: None,
+                docker_command: "docker".to_string(),
+            }],
+            ..AppConfig::default()
+        }
+    }
+
+    /// A running tunnel whose SSH process is already gone, so a refresh has to
+    /// rebuild it. The local port is only carried as tunnel metadata: nothing
+    /// in these tests binds it, which keeps the tests off the ephemeral range.
+    fn desired_running_tunnel() -> TunnelState {
+        TunnelState {
+            ssh_pid: None,
+            ..direct_tunnel(TunnelStatus::Running)
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_stalling_ssh(app: &TempApp, marker: &Path, inspect_json: &str) -> PathBuf {
+        let script = app.dir.join("stalling-ssh");
+        let body = format!(
+            "#!/bin/sh\n: > {marker}\nsleep 1\ncat <<'INSPECT'\n{inspect_json}\nINSPECT\n",
+            marker = marker.display(),
+        );
+        std::fs::write(&script, body).expect("fake ssh should be written");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("fake ssh metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("fake ssh should be executable");
+        script
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} was never created", path.display());
+    }
+
+    #[cfg(unix)]
+    const REFRESHED_INSPECT: &str = r#"[{"Id":"sha256:new","State":{"Running":true},"Config":{"Labels":{"com.docker.compose.project":"app","com.docker.compose.service":"db"}},"NetworkSettings":{"Networks":{"app_default":{"IPAddress":"172.22.0.8","GlobalIPv6Address":""}}}}]"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_transaction_does_not_overwrite_a_concurrent_close() {
+        let app = TempApp::new("refresh-close-race");
+        let marker = app.dir.join("inspect.started");
+        let ssh = write_stalling_ssh(&app, &marker, REFRESHED_INSPECT);
+        std::fs::write(
+            &app.config_file,
+            toml::to_string_pretty(&staging_config(&ssh.to_string_lossy()))
+                .expect("config should serialize"),
+        )
+        .expect("config file should be written");
+        app.write_state(&AppState {
+            tunnels: vec![desired_running_tunnel()],
+        });
+
+        // The refresh holds the state lock for the whole reconciliation and is
+        // stalled inside its remote inspect until the fake ssh finishes.
+        let refresh = refresh_state_at(&app.config_file, &app.state_file);
+        let close = async {
+            wait_for_path(&marker).await;
+            close_tunnel_at(&app.state_file, "db").await
+        };
+        let (refresh_result, close_result) = tokio::join!(refresh, close);
+
+        refresh_result.expect("refresh should reconcile the tunnel");
+        close_result.expect("a close requested during a refresh should succeed");
+
+        let state = app.read_state();
+        assert_eq!(state.tunnels.len(), 1);
+        assert_eq!(
+            state.tunnels[0].status,
+            TunnelStatus::Stopped,
+            "the refresh must not resurrect a tunnel stopped while it was reconciling"
+        );
+        assert_eq!(state.tunnels[0].ssh_pid, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_all_transaction_stops_every_tunnel_and_terminates_its_process() {
+        let app = TempApp::new("close-all");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a long-running child");
+        let pid = child.id().expect("spawned child should have a pid");
+
+        let mut running = direct_tunnel(TunnelStatus::Running);
+        running.ssh_pid = Some(pid);
+        let mut errored = direct_tunnel(TunnelStatus::Error);
+        errored.id = "cache".to_string();
+        errored.ssh_pid = None;
+        let stopped = direct_tunnel(TunnelStatus::Stopped);
+        app.write_state(&AppState {
+            tunnels: vec![running, errored, stopped],
+        });
+
+        time::timeout(
+            Duration::from_secs(10),
+            close_all_tunnels_at(&app.state_file),
+        )
+        .await
+        .expect("close all must not self-deadlock on the state lock")
+        .expect("close all should succeed");
+
+        let mut exited = false;
+        for _ in 0..100 {
+            if child.try_wait().expect("try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        if !exited {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        assert!(exited, "close all must terminate the recorded SSH process");
+
+        let state = app.read_state();
+        assert_eq!(state.tunnels.len(), 3);
+        assert!(state
+            .tunnels
+            .iter()
+            .all(|tunnel| tunnel.status == TunnelStatus::Stopped && tunnel.ssh_pid.is_none()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_forward_startup_exit_is_reported_as_an_open_failure() {
+        let defaults = Defaults {
+            local_host: "127.0.0.1".to_string(),
+            ssh_binary: "sh".to_string(),
+            docker_timeout_secs: 5,
+        };
+        let server = staging_config("sh").servers.remove(0);
+
+        let error = spawn_ssh_forward(&defaults, &server, "127.0.0.1", 15432, "172.22.0.4", 5432)
+            .await
+            .expect_err("a forward that exits during startup must fail");
+
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "unexpected startup error: {error}"
+        );
     }
 
     #[test]
@@ -2817,6 +3138,17 @@ mod tests {
         assert_eq!(
             resolve_network("app", &service, None).expect("default network should resolve"),
             "app_default"
+        );
+    }
+
+    #[test]
+    fn network_resolution_selects_the_only_attached_network() {
+        let service = compose_service("api", "app-api-1", &["shared"]);
+
+        assert_eq!(
+            resolve_network("app", &service, None)
+                .expect("the only attached network should resolve"),
+            "shared"
         );
     }
 

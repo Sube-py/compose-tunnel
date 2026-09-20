@@ -60,3 +60,8 @@ export function resolveServerAfterRefresh(current: string, names: string[]): str
   }
   return names[0] ?? "";
 }
+
+export function withErrorTooltip(label: string, lastError?: string | null): string {
+  const error = lastError?.trim();
+  return error ? `${label} — ${error}` : label;
+}

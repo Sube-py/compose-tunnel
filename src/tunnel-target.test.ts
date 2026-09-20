@@ -5,6 +5,7 @@ import {
   resolveServerAfterRefresh,
   servicesFor,
   suggestNetwork,
+  withErrorTooltip,
   type ComposeService,
 } from "./tunnel-target";
 
@@ -44,6 +45,15 @@ describe("container tunnel targets", () => {
     expect(suggestNetwork("app", services[0])).toBe("app_default");
   });
 
+  it("selects the only attached network when no project default exists", () => {
+    expect(
+      suggestNetwork("app", {
+        ...services[0],
+        networks: ["shared"],
+      }),
+    ).toBe("shared");
+  });
+
   it("leaves an ambiguous non-default network unselected", () => {
     expect(
       suggestNetwork("app", {
@@ -75,6 +85,25 @@ describe("cached service provenance", () => {
     const source = { server: "s1", project: "web" };
     expect(servicesFor(services, source, "", "web")).toEqual([]);
     expect(servicesFor(services, source, "s1", "")).toEqual([]);
+  });
+});
+
+describe("tunnel row tooltips", () => {
+  it("appends the stored error to the remote label", () => {
+    expect(
+      withErrorTooltip(
+        "staging / app / db (app-db-1):5432",
+        "container app-db-1 is not running",
+      ),
+    ).toBe("staging / app / db (app-db-1):5432 — container app-db-1 is not running");
+  });
+
+  it("keeps the remote label when no error is stored", () => {
+    expect(withErrorTooltip("staging / app / db (app-db-1):5432", null)).toBe(
+      "staging / app / db (app-db-1):5432",
+    );
+    expect(withErrorTooltip("label", "")).toBe("label");
+    expect(withErrorTooltip("label", "   ")).toBe("label");
   });
 });
 

@@ -9,7 +9,7 @@ use compose_tunnel_core::{
     init_config, list_compose_projects, list_compose_services, list_env_profiles, list_servers,
     list_tunnels, open_tunnel, render_env_profile, save_env_profile, save_server,
     set_active_env_profile, test_server, write_env_profile, EnvPlainEntry, EnvProfileConfig,
-    EnvTunnelPort, OpenTunnelRequest, ServerConfig, WriteEnvProfileRequest,
+    EnvTunnelPort, OpenTunnelRequest, ServerConfig, TunnelState, WriteEnvProfileRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -215,19 +215,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Status => {
-            println!("ID\tSERVER\tPROJECT\tSERVICE\tCONTAINER\tLOCAL\tMODE\tSTATUS");
+            println!("ID\tSERVER\tPROJECT\tSERVICE\tCONTAINER\tLOCAL\tMODE\tSTATUS\tERROR");
             for tunnel in list_tunnels().await? {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}:{}\tcontainer-direct\t{:?}",
-                    tunnel.id,
-                    tunnel.server,
-                    tunnel.project,
-                    tunnel.service,
-                    tunnel.container,
-                    tunnel.local_host,
-                    tunnel.local_port,
-                    tunnel.status
-                );
+                println!("{}", tunnel_status_row(&tunnel));
             }
         }
         Command::Env(args) => handle_env(args).await?,
@@ -524,9 +514,59 @@ fn ok_text(value: bool) -> &'static str {
     }
 }
 
+fn tunnel_status_row(tunnel: &TunnelState) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}:{}\tcontainer-direct\t{:?}\t{}",
+        tunnel.id,
+        tunnel.server,
+        tunnel.project,
+        tunnel.service,
+        tunnel.container,
+        tunnel.local_host,
+        tunnel.local_port,
+        tunnel.status,
+        tunnel.last_error.as_deref().unwrap_or("-")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compose_tunnel_core::{TunnelMode, TunnelStatus};
+
+    fn status_tunnel() -> TunnelState {
+        TunnelState {
+            id: "db".to_string(),
+            server: "staging".to_string(),
+            project: "app".to_string(),
+            service: "db".to_string(),
+            container: "app-db-1".to_string(),
+            container_id: "sha256:abc123".to_string(),
+            container_ip: "172.22.0.4".to_string(),
+            network: "app_default".to_string(),
+            target_port: 5432,
+            local_host: "127.0.0.1".to_string(),
+            local_port: 15432,
+            ssh_pid: Some(1234),
+            status: TunnelStatus::Running,
+            mode: TunnelMode::ContainerDirect,
+            started_at: Some("2026-09-20T12:00:00Z".to_string()),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn status_row_shows_the_last_error_only_when_one_exists() {
+        let mut tunnel = status_tunnel();
+
+        assert!(tunnel_status_row(&tunnel).ends_with("\tRunning\t-"));
+
+        tunnel.status = TunnelStatus::Error;
+        tunnel.ssh_pid = None;
+        tunnel.last_error = Some("container app-db-1 is not running".to_string());
+
+        assert!(tunnel_status_row(&tunnel).ends_with("\tError\tcontainer app-db-1 is not running"));
+    }
 
     #[test]
     fn parses_open_with_concrete_container() {
