@@ -18,11 +18,15 @@ import SelectButton from "primevue/selectbutton";
 import Tag from "primevue/tag";
 import Toast from "primevue/toast";
 import logoUrl from "../assets/logo.svg";
+import {
+  buildContainerOptions,
+  findContainer,
+  suggestNetwork,
+  type ComposeService,
+} from "./tunnel-target";
 
 type Defaults = {
   local_host: string;
-  socat_image: string;
-  socat_command: string;
   ssh_binary: string;
   docker_timeout_secs: number;
 };
@@ -34,7 +38,6 @@ type ServerConfig = {
   user: string;
   identity_file?: string | null;
   ssh_alias?: string | null;
-  default_socat_image?: string | null;
   docker_command: string;
 };
 
@@ -51,30 +54,21 @@ type ComposeProject = {
   services: string[];
 };
 
-type ComposeService = {
-  service: string;
-  container: string;
-  status: string;
-  ports: string[];
-  networks: string[];
-  image: string;
-};
-
 type TunnelState = {
   id: string;
   server: string;
   project: string;
   service: string;
+  container: string;
+  container_id: string;
+  container_ip: string;
   network: string;
   target_port: number;
-  socat_port: number;
   local_host: string;
   local_port: number;
-  socat_container: string;
-  socat_container_ip: string;
   ssh_pid?: number | null;
   status: "running" | "stopped" | "error";
-  mode: "socat-direct";
+  mode: "container-direct";
   started_at?: string | null;
   last_error?: string | null;
 };
@@ -105,11 +99,6 @@ type EnvProjectRow = {
   profile_count: number;
 };
 
-type CleanupResult = {
-  server: string;
-  containers: string[];
-};
-
 const tabs = ["Dashboard", "Servers", "Compose", "Tunnels", "Env", "Logs", "Settings"] as const;
 type Tab = (typeof tabs)[number];
 
@@ -121,8 +110,6 @@ const busyActions = ref<Record<string, boolean>>({});
 const logs = ref<string[]>([]);
 const defaults = reactive<Defaults>({
   local_host: "127.0.0.1",
-  socat_image: "alpine/socat:latest",
-  socat_command: "socat",
   ssh_binary: "ssh",
   docker_timeout_secs: 20,
 });
@@ -154,7 +141,6 @@ const serverForm = reactive<ServerConfig>({
   user: "",
   identity_file: "",
   ssh_alias: "",
-  default_socat_image: "",
   docker_command: "docker",
 });
 
@@ -162,10 +148,10 @@ const tunnelForm = reactive({
   server: "",
   project: "",
   service: "",
+  container: "",
   target_port: 5432,
   network: "",
   local_port: "",
-  socat_image: "",
 });
 
 const envProfileForm = reactive<EnvProfileConfig>({
@@ -269,8 +255,9 @@ const tunnelProjectOptions = computed(() =>
 const tunnelServiceOptions = computed(() =>
   services.value.filter(() => selectedServer.value === tunnelForm.server && selectedProject.value === tunnelForm.project),
 );
+const tunnelContainerOptions = computed(() => buildContainerOptions(tunnelServiceOptions.value));
 const selectedTunnelService = computed(
-  () => tunnelServiceOptions.value.find((service) => service.service === tunnelForm.service) ?? null,
+  () => findContainer(tunnelServiceOptions.value, tunnelForm.container),
 );
 
 function setTab(tab: Tab) {
@@ -480,7 +467,6 @@ function editServer(server: ServerConfig) {
     user: server.user,
     identity_file: server.identity_file ?? "",
     ssh_alias: server.ssh_alias ?? "",
-    default_socat_image: server.default_socat_image ?? "",
     docker_command: server.docker_command || "docker",
   });
   serverAuthMode.value = server.ssh_alias ? "alias" : "identity";
@@ -546,11 +532,19 @@ async function discoverProjects() {
     projects.value = result;
     services.value = [];
     selectedProject.value = "";
+    tunnelForm.service = "";
+    tunnelForm.container = "";
+    tunnelForm.network = "";
   }
 }
 
 async function loadServices(project: string) {
   selectedProject.value = project;
+  if (project !== tunnelForm.project) {
+    tunnelForm.service = "";
+    tunnelForm.container = "";
+    tunnelForm.network = "";
+  }
   const result = await runTask(
     `Loaded services for ${project}`,
     async () =>
@@ -570,7 +564,8 @@ function pickService(service: ComposeService) {
   tunnelForm.server = selectedServer.value;
   tunnelForm.project = selectedProject.value;
   tunnelForm.service = service.service;
-  tunnelForm.network = service.networks[0] ?? "";
+  tunnelForm.container = service.container;
+  tunnelForm.network = suggestNetwork(selectedProject.value, service);
   tunnelForm.local_port = "";
   const port = inferPort(service);
   if (port) {
@@ -589,12 +584,11 @@ async function openTunnel() {
           server: tunnelForm.server,
           project: tunnelForm.project,
           service: tunnelForm.service,
+          container: optional(tunnelForm.container),
           target_port: Number(tunnelForm.target_port),
           network: optional(tunnelForm.network),
           local_port: tunnelForm.local_port ? Number(tunnelForm.local_port) : null,
           local_host: defaults.local_host,
-          socat_port: null,
-          socat_image: optional(tunnelForm.socat_image),
         },
       });
       tunnelForm.local_port = "";
@@ -606,12 +600,14 @@ async function openTunnel() {
   );
 }
 
-function openTunnelDialog() {
-  if (tunnelServerFilter.value !== "all" && tunnelServerFilter.value) {
-    tunnelForm.server = tunnelServerFilter.value;
-    selectedServer.value = tunnelServerFilter.value;
-  } else if (!tunnelForm.server && servers.value.length > 0) {
-    tunnelForm.server = servers.value[0].name;
+async function openTunnelDialog() {
+  const filtered = tunnelServerFilter.value !== "all" && tunnelServerFilter.value ? tunnelServerFilter.value : "";
+  const nextServer = filtered || tunnelForm.server || servers.value[0]?.name || "";
+  if (nextServer !== tunnelForm.server) {
+    tunnelForm.server = nextServer;
+    await onTunnelServerChange();
+  } else if (filtered) {
+    selectedServer.value = filtered;
   }
   tunnelDialogVisible.value = true;
 }
@@ -620,6 +616,7 @@ async function onTunnelServerChange() {
   selectedServer.value = tunnelForm.server;
   tunnelForm.project = "";
   tunnelForm.service = "";
+  tunnelForm.container = "";
   tunnelForm.network = "";
   services.value = [];
   if (tunnelForm.server) {
@@ -639,19 +636,22 @@ async function onTunnelProjectChange() {
   selectedServer.value = tunnelForm.server;
   selectedProject.value = tunnelForm.project;
   tunnelForm.service = "";
+  tunnelForm.container = "";
   tunnelForm.network = "";
   if (tunnelForm.server && tunnelForm.project) {
     await loadServices(tunnelForm.project);
   }
 }
 
-function onTunnelServiceChange() {
+function onTunnelContainerChange() {
   const service = selectedTunnelService.value;
   if (!service) {
+    tunnelForm.service = "";
     tunnelForm.network = "";
     return;
   }
-  tunnelForm.network = service.networks[0] ?? "";
+  tunnelForm.service = service.service;
+  tunnelForm.network = suggestNetwork(tunnelForm.project, service);
   const port = inferPort(service);
   if (port) {
     tunnelForm.target_port = port;
@@ -673,7 +673,7 @@ async function closeTunnel(id: string) {
 async function stopAllTunnels() {
   confirm.require({
     header: "Stop all tunnels",
-    message: `Stop ${runningCount.value} running tunnel(s) and remove their remote socat containers?`,
+    message: `Stop ${runningCount.value} running local tunnel(s)?`,
     icon: "pi pi-exclamation-triangle",
     rejectProps: {
       label: "Cancel",
@@ -702,67 +702,6 @@ async function runStopAllTunnels() {
   );
 }
 
-async function cleanupSelectedServer() {
-  if (tunnelServerFilter.value === "all" || !tunnelServerFilter.value) {
-    toast.add({ severity: "warn", summary: "Select a server first", life: 3000 });
-    return;
-  }
-  const serverId = tunnelServerFilter.value;
-  const preview = await runTask(
-    `Previewed cleanup ${serverId}`,
-    async () => invoke<CleanupResult>("preview_cleanup", { serverId }),
-    false,
-    "tunnel:cleanup",
-  );
-  if (!preview) {
-    return;
-  }
-  if (preview.containers.length === 0) {
-    toast.add({ severity: "info", summary: "Nothing to clean up", detail: `No containers found on ${preview.server}`, life: 3200 });
-    return;
-  }
-
-  const containerList = preview.containers.slice(0, 5).join(", ");
-  const extraCount = preview.containers.length > 5 ? ` and ${preview.containers.length - 5} more` : "";
-  confirm.require({
-    header: "Cleanup remote containers",
-    message: `Remove ${preview.containers.length} compose-tunnel container(s) from ${preview.server}: ${containerList}${extraCount}?`,
-    icon: "pi pi-exclamation-triangle",
-    rejectProps: {
-      label: "Cancel",
-      severity: "secondary",
-      outlined: true,
-    },
-    acceptProps: {
-      label: "Cleanup",
-      severity: "danger",
-    },
-    accept: () => {
-      void runCleanupSelectedServer(serverId);
-    },
-  });
-}
-
-async function runCleanupSelectedServer(serverId: string) {
-  const result = await runTask(
-    `Cleaned up ${serverId}`,
-    async () => invoke<CleanupResult>("cleanup", { serverId }),
-    false,
-    "tunnel:cleanup",
-  );
-  if (!result) {
-    return;
-  }
-  const detail = result.containers.length
-    ? `${result.containers.length} containers removed`
-    : "No compose-tunnel containers found";
-  logs.value.unshift(
-    `${new Date().toLocaleTimeString()} Cleanup ${result.server}: ${result.containers.join(", ") || "nothing to remove"}`,
-  );
-  toast.add({ severity: "success", summary: "Cleanup complete", detail, life: 3600 });
-  await refreshTunnels();
-}
-
 async function startTunnel(tunnel: TunnelState) {
   await runTask(
     `Started tunnel ${tunnel.id}`,
@@ -781,12 +720,11 @@ async function openTunnelFromState(tunnel: TunnelState, localPort: number | null
       server: tunnel.server,
       project: tunnel.project,
       service: tunnel.service,
+      container: optional(tunnel.container),
       target_port: tunnel.target_port,
-      network: tunnel.network,
+      network: optional(tunnel.network),
       local_port: localPort,
       local_host: tunnel.local_host || defaults.local_host,
-      socat_port: tunnel.socat_port,
-      socat_image: null,
     },
   });
 }
@@ -1262,7 +1200,6 @@ function clearServerForm() {
     user: "",
     identity_file: "",
     ssh_alias: "",
-    default_socat_image: "",
     docker_command: "docker",
   });
 }
@@ -1275,7 +1212,6 @@ function compactServer(server: ServerConfig): ServerConfig {
     user: server.user.trim(),
     identity_file: serverAuthMode.value === "identity" ? optional(server.identity_file) : null,
     ssh_alias: serverAuthMode.value === "alias" ? optional(server.ssh_alias) : null,
-    default_socat_image: optional(server.default_socat_image),
     docker_command: server.docker_command.trim() || "docker",
   };
 }
@@ -1302,7 +1238,7 @@ function statusSeverity(status: string) {
 }
 
 function tunnelRemoteLabel(tunnel: TunnelState) {
-  return `${tunnel.server} / ${tunnel.project} / ${tunnel.service}:${tunnel.target_port}`;
+  return `${tunnel.server} / ${tunnel.project} / ${tunnel.service} (${tunnel.container}):${tunnel.target_port}`;
 }
 
 function tunnelLocalLabel(tunnel: TunnelState) {
@@ -1463,7 +1399,6 @@ onMounted(bootstrap);
                 <Select :modelValue="dockerCommandPreset" :options="dockerModeOptions" optionLabel="label" optionValue="value" @update:modelValue="onDockerModeChange" />
               </label>
               <label>Docker command<InputText v-model="serverForm.docker_command" autocapitalize="off" autocorrect="off" spellcheck="false" required /></label>
-              <label>Default socat image<InputText v-model="serverForm.default_socat_image" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="alpine/socat:latest" /></label>
             </div>
             <div class="dialog-actions">
               <Button label="Cancel" severity="secondary" outlined type="button" :disabled="isBusy('server:save')" @click="serverDialogVisible = false" />
@@ -1509,15 +1444,6 @@ onMounted(bootstrap);
                 optionLabel="label"
                 optionValue="value"
                 placeholder="All"
-              />
-              <Button
-                label="Cleanup"
-                icon="pi pi-trash"
-                severity="danger"
-                outlined
-                :loading="isBusy('tunnel:cleanup')"
-                :disabled="tunnelServerFilter === 'all' || isBusy('tunnel:cleanup')"
-                @click="cleanupSelectedServer"
               />
             </div>
           </div>
@@ -1587,7 +1513,7 @@ onMounted(bootstrap);
               </label>
               <label>
                 Service container
-                <Select v-model="tunnelForm.service" :options="tunnelServiceOptions" optionLabel="container" optionValue="service" placeholder="Select service" @update:modelValue="onTunnelServiceChange" />
+                <Select v-model="tunnelForm.container" :options="tunnelContainerOptions" optionLabel="label" optionValue="value" placeholder="Select container" @update:modelValue="onTunnelContainerChange" />
               </label>
               <label>
                 Network
@@ -1596,7 +1522,6 @@ onMounted(bootstrap);
               </label>
               <label>Target port<InputNumber v-model="tunnelForm.target_port" :min="1" :useGrouping="false" fluid /></label>
               <label>Local port<InputText v-model="tunnelForm.local_port" placeholder="auto assign" /></label>
-              <label>socat image<InputText v-model="tunnelForm.socat_image" :placeholder="defaults.socat_image" /></label>
             </div>
             <div class="dialog-actions">
               <Button label="Cancel" severity="secondary" outlined type="button" :disabled="isBusy('tunnel:create')" @click="tunnelDialogVisible = false" />
@@ -1791,8 +1716,6 @@ onMounted(bootstrap);
 
       <section v-if="activeTab === 'Settings'" class="page form settings">
         <label>Default local host<InputText v-model="defaults.local_host" /></label>
-        <label>Default socat image<InputText v-model="defaults.socat_image" /></label>
-        <label>socat command<InputText v-model="defaults.socat_command" /></label>
         <label>SSH binary<InputText v-model="defaults.ssh_binary" /></label>
         <label>Docker timeout seconds<InputNumber v-model="defaults.docker_timeout_secs" :min="1" :useGrouping="false" fluid /></label>
         <Button label="Save Settings" icon="pi pi-save" :loading="isBusy('settings:save')" :disabled="isBusy('settings:save')" @click="saveDefaultSettings" />
