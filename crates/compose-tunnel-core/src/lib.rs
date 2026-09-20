@@ -888,10 +888,7 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         .iter()
         .find(|tunnel| tunnel.id == tunnel_id)
     {
-        if let Some(pid) = previous.ssh_pid {
-            let _ = kill_pid(pid).await;
-        }
-        wait_for_local_port_release(&previous.local_host, previous.local_port).await?;
+        release_previous_tunnel(previous).await?;
     }
 
     let local_port =
@@ -1437,6 +1434,14 @@ fn ensure_local_port_available(host: &str, port: u16) -> Result<()> {
 
 fn local_port_available(host: &str, port: u16) -> bool {
     TcpListener::bind((host, port)).is_ok()
+}
+
+async fn release_previous_tunnel(previous: &TunnelState) -> Result<()> {
+    let Some(pid) = previous.ssh_pid else {
+        return Ok(());
+    };
+    let _ = kill_pid(pid).await;
+    wait_for_local_port_release(&previous.local_host, previous.local_port).await
 }
 
 async fn wait_for_local_port_release(host: &str, port: u16) -> Result<()> {
@@ -2249,6 +2254,20 @@ mod tests {
             resolve_local_port(&state, "db", "127.0.0.1", None).expect("local port should resolve");
 
         assert_ne!(resolved, port);
+    }
+
+    #[tokio::test]
+    async fn stopped_previous_tunnel_without_pid_does_not_wait_for_its_old_port() {
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
+        let port = occupied
+            .local_addr()
+            .expect("local address should resolve")
+            .port();
+        let previous = stopped_tunnel_with_local_port("db", port);
+
+        release_previous_tunnel(&previous)
+            .await
+            .expect("a previous tunnel without a pid must not wait for its old port");
     }
 
     #[test]
