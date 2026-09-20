@@ -1764,40 +1764,144 @@ async fn upsert_tunnel_state(tunnel: TunnelState) -> Result<()> {
     save_state(&state).await
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileDecision {
+    Skip,
+    Keep,
+    UpdateIdentity,
+    Restart,
+}
+
+fn reconciliation_decision(
+    tunnel: &TunnelState,
+    inspected: &InspectedContainer,
+    pid_running: bool,
+) -> ReconcileDecision {
+    if tunnel.status == TunnelStatus::Stopped {
+        return ReconcileDecision::Skip;
+    }
+    if tunnel.status == TunnelStatus::Error || !pid_running || inspected.ip != tunnel.container_ip {
+        return ReconcileDecision::Restart;
+    }
+    if inspected.id != tunnel.container_id {
+        return ReconcileDecision::UpdateIdentity;
+    }
+    ReconcileDecision::Keep
+}
+
+fn mark_reconciliation_error(tunnel: &mut TunnelState, error: impl Into<String>) -> bool {
+    let error = error.into();
+    let changed = tunnel.status != TunnelStatus::Error
+        || tunnel.ssh_pid.is_some()
+        || tunnel.last_error.as_deref() != Some(error.as_str());
+    tunnel.status = TunnelStatus::Error;
+    tunnel.ssh_pid = None;
+    tunnel.last_error = Some(error);
+    changed
+}
+
+async fn terminate_and_mark_reconciliation_error(
+    tunnel: &mut TunnelState,
+    error: impl Into<String>,
+) -> bool {
+    if let Some(pid) = tunnel.ssh_pid {
+        if pid_is_running(pid) {
+            let _ = kill_pid(pid).await;
+        }
+    }
+    mark_reconciliation_error(tunnel, error)
+}
+
 async fn load_refreshed_state() -> Result<AppState> {
+    let config = load_config().await?;
     let mut state = load_state().await?;
-    let changed = refresh_tunnel_process_statuses(&mut state, pid_is_running);
-    if changed {
+    if reconcile_tunnels(&config, &mut state).await {
         save_state(&state).await?;
     }
     Ok(state)
 }
 
-fn refresh_tunnel_process_statuses<F>(state: &mut AppState, mut pid_running: F) -> bool
-where
-    F: FnMut(u32) -> bool,
-{
+async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> bool {
     let mut changed = false;
+
     for tunnel in &mut state.tunnels {
-        if tunnel.status != TunnelStatus::Running {
+        if tunnel.status == TunnelStatus::Stopped {
             continue;
         }
 
-        match tunnel.ssh_pid {
-            Some(pid) if pid_running(pid) => {}
-            Some(pid) => {
-                tunnel.status = TunnelStatus::Stopped;
-                tunnel.ssh_pid = None;
-                tunnel.last_error = Some(format!("ssh process {pid} is not running"));
+        let Some(server) = config
+            .servers
+            .iter()
+            .find(|server| server.name == tunnel.server)
+            .cloned()
+        else {
+            changed |= terminate_and_mark_reconciliation_error(
+                tunnel,
+                format!("server {} was not found", tunnel.server),
+            )
+            .await;
+            continue;
+        };
+
+        let inspected = match inspect_container(
+            &config.defaults,
+            &server,
+            &tunnel.container,
+            &tunnel.project,
+            &tunnel.service,
+            &tunnel.network,
+        )
+        .await
+        {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                changed |= terminate_and_mark_reconciliation_error(tunnel, error.to_string()).await;
+                continue;
+            }
+        };
+
+        let pid_running = tunnel.ssh_pid.is_some_and(pid_is_running);
+        match reconciliation_decision(tunnel, &inspected, pid_running) {
+            ReconcileDecision::Skip | ReconcileDecision::Keep => {}
+            ReconcileDecision::UpdateIdentity => {
+                tunnel.container_id = inspected.id;
+                tunnel.last_error = None;
                 changed = true;
             }
-            None => {
-                tunnel.status = TunnelStatus::Error;
-                tunnel.last_error = Some("running tunnel has no ssh process id".to_string());
-                changed = true;
+            ReconcileDecision::Restart => {
+                if let Err(error) = release_previous_tunnel(tunnel).await {
+                    changed |= mark_reconciliation_error(tunnel, error.to_string());
+                    continue;
+                }
+                tunnel.ssh_pid = None;
+
+                match spawn_ssh_forward(
+                    &config.defaults,
+                    &server,
+                    &tunnel.local_host,
+                    tunnel.local_port,
+                    &inspected.ip,
+                    tunnel.target_port,
+                )
+                .await
+                {
+                    Ok(child) => {
+                        tunnel.container_id = inspected.id;
+                        tunnel.container_ip = inspected.ip;
+                        tunnel.ssh_pid = child.id();
+                        tunnel.status = TunnelStatus::Running;
+                        tunnel.started_at = Some(now_string());
+                        tunnel.last_error = None;
+                        changed = true;
+                    }
+                    Err(error) => {
+                        changed |= mark_reconciliation_error(tunnel, error.to_string());
+                    }
+                }
             }
         }
     }
+
     changed
 }
 
@@ -2148,50 +2252,90 @@ mod tests {
     }
 
     #[test]
-    fn refresh_tunnel_status_marks_dead_ssh_process_as_stopped() {
-        let mut state = AppState {
-            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
+    fn reconciliation_skips_user_stopped_tunnel() {
+        let tunnel = direct_tunnel(TunnelStatus::Stopped);
+        let inspected = InspectedContainer {
+            container: tunnel.container.clone(),
+            id: tunnel.container_id.clone(),
+            network: tunnel.network.clone(),
+            ip: tunnel.container_ip.clone(),
         };
 
-        let changed = refresh_tunnel_process_statuses(&mut state, |_| false);
-
-        assert!(changed);
-        assert_eq!(state.tunnels[0].status, TunnelStatus::Stopped);
-        assert_eq!(state.tunnels[0].ssh_pid, None);
         assert_eq!(
-            state.tunnels[0].last_error.as_deref(),
-            Some("ssh process 1234 is not running")
+            reconciliation_decision(&tunnel, &inspected, false),
+            ReconcileDecision::Skip
         );
     }
 
     #[test]
-    fn refresh_tunnel_status_keeps_live_ssh_process_running() {
-        let mut state = AppState {
-            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
+    fn reconciliation_keeps_matching_live_forward() {
+        let tunnel = direct_tunnel(TunnelStatus::Running);
+        let inspected = InspectedContainer {
+            container: tunnel.container.clone(),
+            id: tunnel.container_id.clone(),
+            network: tunnel.network.clone(),
+            ip: tunnel.container_ip.clone(),
         };
 
-        let changed = refresh_tunnel_process_statuses(&mut state, |_| true);
-
-        assert!(!changed);
-        assert_eq!(state.tunnels[0].status, TunnelStatus::Running);
-        assert_eq!(state.tunnels[0].ssh_pid, Some(1234));
-        assert_eq!(state.tunnels[0].last_error, None);
+        assert_eq!(
+            reconciliation_decision(&tunnel, &inspected, true),
+            ReconcileDecision::Keep
+        );
     }
 
     #[test]
-    fn refresh_tunnel_status_marks_running_without_pid_as_error() {
-        let mut state = AppState {
-            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
+    fn reconciliation_updates_identity_without_restart_when_ip_is_reused() {
+        let tunnel = direct_tunnel(TunnelStatus::Running);
+        let inspected = InspectedContainer {
+            container: tunnel.container.clone(),
+            id: "sha256:new".to_string(),
+            network: tunnel.network.clone(),
+            ip: tunnel.container_ip.clone(),
         };
-        state.tunnels[0].ssh_pid = None;
 
-        let changed = refresh_tunnel_process_statuses(&mut state, |_| true);
-
-        assert!(changed);
-        assert_eq!(state.tunnels[0].status, TunnelStatus::Error);
         assert_eq!(
-            state.tunnels[0].last_error.as_deref(),
-            Some("running tunnel has no ssh process id")
+            reconciliation_decision(&tunnel, &inspected, true),
+            ReconcileDecision::UpdateIdentity
+        );
+    }
+
+    #[test]
+    fn reconciliation_restarts_for_changed_ip_dead_pid_or_error_state() {
+        let running = direct_tunnel(TunnelStatus::Running);
+        let changed = InspectedContainer {
+            container: running.container.clone(),
+            id: "sha256:new".to_string(),
+            network: running.network.clone(),
+            ip: "172.22.0.8".to_string(),
+        };
+        assert_eq!(
+            reconciliation_decision(&running, &changed, true),
+            ReconcileDecision::Restart
+        );
+        assert_eq!(
+            reconciliation_decision(&running, &changed, false),
+            ReconcileDecision::Restart
+        );
+
+        let errored = direct_tunnel(TunnelStatus::Error);
+        assert_eq!(
+            reconciliation_decision(&errored, &changed, false),
+            ReconcileDecision::Restart
+        );
+    }
+
+    #[test]
+    fn reconciliation_error_clears_pid_and_preserves_desired_target() {
+        let mut tunnel = direct_tunnel(TunnelStatus::Running);
+
+        mark_reconciliation_error(&mut tunnel, "container app-db-1 is not running");
+
+        assert_eq!(tunnel.status, TunnelStatus::Error);
+        assert_eq!(tunnel.ssh_pid, None);
+        assert_eq!(tunnel.container, "app-db-1");
+        assert_eq!(
+            tunnel.last_error.as_deref(),
+            Some("container app-db-1 is not running")
         );
     }
 
