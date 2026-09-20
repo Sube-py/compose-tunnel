@@ -21,8 +21,11 @@ import logoUrl from "../assets/logo.svg";
 import {
   buildContainerOptions,
   findContainer,
+  resolveServerAfterRefresh,
+  servicesFor,
   suggestNetwork,
   type ComposeService,
+  type ServiceSource,
 } from "./tunnel-target";
 
 type Defaults = {
@@ -116,6 +119,7 @@ const defaults = reactive<Defaults>({
 const servers = ref<ServerConfig[]>([]);
 const projects = ref<ComposeProject[]>([]);
 const services = ref<ComposeService[]>([]);
+const servicesSource = ref<ServiceSource | null>(null);
 const tunnels = ref<TunnelState[]>([]);
 const envProfiles = ref<EnvProfileConfig[]>([]);
 const activeEnvProfiles = ref<Record<string, string>>({});
@@ -253,7 +257,7 @@ const tunnelProjectOptions = computed(() =>
   projects.value.filter((project) => project.server === tunnelForm.server),
 );
 const tunnelServiceOptions = computed(() =>
-  services.value.filter(() => selectedServer.value === tunnelForm.server && selectedProject.value === tunnelForm.project),
+  servicesFor(services.value, servicesSource.value, tunnelForm.server, tunnelForm.project),
 );
 const tunnelContainerOptions = computed(() => buildContainerOptions(tunnelServiceOptions.value));
 const selectedTunnelService = computed(
@@ -325,8 +329,13 @@ async function bootstrap() {
 
 async function refreshServers() {
   servers.value = await invoke<ServerConfig[]>("list_servers");
-  if (!selectedServer.value && servers.value.length > 0) {
-    selectedServer.value = servers.value[0].name;
+  const serverNames = servers.value.map((server) => server.name);
+  if (servicesSource.value && !serverNames.includes(servicesSource.value.server)) {
+    invalidateServices();
+  }
+  const resolvedSelected = resolveServerAfterRefresh(selectedServer.value, serverNames);
+  if (resolvedSelected !== selectedServer.value) {
+    selectedServer.value = resolvedSelected;
   }
   if (
     tunnelServerFilter.value !== "all" &&
@@ -335,8 +344,11 @@ async function refreshServers() {
   ) {
     tunnelServerFilter.value = "all";
   }
-  if (!tunnelForm.server && servers.value.length > 0) {
-    tunnelForm.server = servers.value[0].name;
+  const resolvedTunnelServer = resolveServerAfterRefresh(tunnelForm.server, serverNames);
+  if (resolvedTunnelServer !== tunnelForm.server) {
+    tunnelForm.server = resolvedTunnelServer;
+    tunnelForm.project = "";
+    clearTunnelTarget();
   }
 }
 
@@ -517,6 +529,18 @@ function applyDockerCommandPreset(value: string) {
   }
 }
 
+function clearTunnelTarget() {
+  tunnelForm.service = "";
+  tunnelForm.container = "";
+  tunnelForm.network = "";
+}
+
+function invalidateServices() {
+  services.value = [];
+  servicesSource.value = null;
+  clearTunnelTarget();
+}
+
 async function discoverProjects() {
   if (!selectedServer.value) {
     toast.add({ severity: "warn", summary: "Select a server first", life: 3000 });
@@ -530,26 +554,24 @@ async function discoverProjects() {
   );
   if (result) {
     projects.value = result;
-    services.value = [];
     selectedProject.value = "";
-    tunnelForm.service = "";
-    tunnelForm.container = "";
-    tunnelForm.network = "";
+    invalidateServices();
   }
 }
 
 async function loadServices(project: string) {
+  const server = selectedServer.value;
   selectedProject.value = project;
   if (project !== tunnelForm.project) {
-    tunnelForm.service = "";
-    tunnelForm.container = "";
-    tunnelForm.network = "";
+    clearTunnelTarget();
   }
+  services.value = [];
+  servicesSource.value = null;
   const result = await runTask(
     `Loaded services for ${project}`,
     async () =>
       invoke<ComposeService[]>("list_compose_services", {
-        serverId: selectedServer.value,
+        serverId: server,
         project,
       }),
     true,
@@ -557,15 +579,21 @@ async function loadServices(project: string) {
   );
   if (result) {
     services.value = result;
+    servicesSource.value = { server, project };
   }
 }
 
 function pickService(service: ComposeService) {
-  tunnelForm.server = selectedServer.value;
-  tunnelForm.project = selectedProject.value;
+  const source = servicesSource.value;
+  if (!source) {
+    toast.add({ severity: "warn", summary: "Load services for a server before creating a tunnel", life: 3000 });
+    return;
+  }
+  tunnelForm.server = source.server;
+  tunnelForm.project = source.project;
   tunnelForm.service = service.service;
   tunnelForm.container = service.container;
-  tunnelForm.network = suggestNetwork(selectedProject.value, service);
+  tunnelForm.network = suggestNetwork(source.project, service);
   tunnelForm.local_port = "";
   const port = inferPort(service);
   if (port) {
@@ -615,10 +643,7 @@ async function openTunnelDialog() {
 async function onTunnelServerChange() {
   selectedServer.value = tunnelForm.server;
   tunnelForm.project = "";
-  tunnelForm.service = "";
-  tunnelForm.container = "";
-  tunnelForm.network = "";
-  services.value = [];
+  invalidateServices();
   if (tunnelForm.server) {
     const result = await runTask(
       `Discovered projects on ${tunnelForm.server}`,
@@ -635,9 +660,7 @@ async function onTunnelServerChange() {
 async function onTunnelProjectChange() {
   selectedServer.value = tunnelForm.server;
   selectedProject.value = tunnelForm.project;
-  tunnelForm.service = "";
-  tunnelForm.container = "";
-  tunnelForm.network = "";
+  invalidateServices();
   if (tunnelForm.server && tunnelForm.project) {
     await loadServices(tunnelForm.project);
   }

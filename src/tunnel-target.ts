@@ -33,3 +33,30 @@ export function suggestNetwork(project: string, service: ComposeService): string
   }
   return service.networks.length === 1 ? service.networks[0] : "";
 }
+
+export type ServiceSource = {
+  server: string;
+  project: string;
+};
+
+export function servicesFor(
+  services: ComposeService[],
+  source: ServiceSource | null,
+  server: string,
+  project: string,
+): ComposeService[] {
+  if (!source || !server || !project) {
+    return [];
+  }
+  if (source.server !== server || source.project !== project) {
+    return [];
+  }
+  return services;
+}
+
+export function resolveServerAfterRefresh(current: string, names: string[]): string {
+  if (current && names.includes(current)) {
+    return current;
+  }
+  return names[0] ?? "";
+}
