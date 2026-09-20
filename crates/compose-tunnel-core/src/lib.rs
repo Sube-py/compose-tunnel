@@ -801,6 +801,43 @@ pub async fn list_compose_services(
     Ok(services)
 }
 
+fn select_compose_container<'a>(
+    services: &'a [ComposeService],
+    project: &str,
+    service: &str,
+    requested_container: Option<&str>,
+) -> Result<&'a ComposeService> {
+    let candidates: Vec<&ComposeService> = services
+        .iter()
+        .filter(|item| item.service == service)
+        .collect();
+
+    if let Some(container) = requested_container {
+        return candidates
+            .into_iter()
+            .find(|item| item.container == container)
+            .ok_or_else(|| {
+                AppError::msg(format!(
+                    "container {container} does not belong to {project}/{service}"
+                ))
+            });
+    }
+
+    match candidates.as_slice() {
+        [] => Err(AppError::msg(format!(
+            "service {service} was not found in project {project}"
+        ))),
+        [container] => Ok(*container),
+        many => Err(AppError::msg(format!(
+            "service {project}/{service} has multiple containers; pass one of: {}",
+            many.iter()
+                .map(|item| item.container.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
     validate_name("project", &request.project)?;
     validate_name("service", &request.service)?;
@@ -820,10 +857,7 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
                 request.service, request.project
             ))
         })?;
-    let network = match request.network.clone() {
-        Some(network) => network,
-        None => choose_network(&request.project, service)?,
-    };
+    let network = resolve_network(&request.project, service, request.network.as_deref())?;
 
     let socat_port = request.socat_port.unwrap_or(request.target_port);
     let local_host = request
@@ -1326,21 +1360,39 @@ async fn remove_socat_container(
     run_ssh(defaults, server, &command).await.map(|_| ())
 }
 
-fn choose_network(project: &str, service: &ComposeService) -> Result<String> {
+fn resolve_network(
+    project: &str,
+    container: &ComposeService,
+    requested_network: Option<&str>,
+) -> Result<String> {
+    if let Some(network) = requested_network {
+        return container
+            .networks
+            .iter()
+            .find(|item| item.as_str() == network)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::msg(format!(
+                    "network {network} is not attached to {}",
+                    container.container
+                ))
+            });
+    }
+
     let default_network = format!("{project}_default");
-    if service
-        .networks
-        .iter()
-        .any(|network| network == &default_network)
-    {
+    if container.networks.contains(&default_network) {
         return Ok(default_network);
     }
-    if service.networks.len() == 1 {
-        return Ok(service.networks[0].clone());
+    if let [network] = container.networks.as_slice() {
+        return Ok(network.clone());
     }
+
+    let mut networks = container.networks.clone();
+    networks.sort();
     Err(AppError::msg(format!(
-        "service {} has multiple networks; pass --network",
-        service.service
+        "container {} has multiple networks; pass one of: {}",
+        container.container,
+        networks.join(", ")
     )))
 }
 
@@ -2531,5 +2583,97 @@ mod tests {
         assert_eq!(profile.tunnel_ports[0].tunnel_id, "redis");
         assert_eq!(profile.tunnel_ports[0].alias, "server_db");
         assert_eq!(profile.tunnel_ports[0].env_key.as_deref(), Some("NEW_PORT"));
+    }
+
+    fn compose_service(service: &str, container: &str, networks: &[&str]) -> ComposeService {
+        ComposeService {
+            service: service.to_string(),
+            container: container.to_string(),
+            status: "Up 1 minute".to_string(),
+            ports: Vec::new(),
+            networks: networks.iter().map(|value| (*value).to_string()).collect(),
+            image: "postgres:16".to_string(),
+        }
+    }
+
+    #[test]
+    fn selects_only_container_when_replica_is_not_specified() {
+        let services = vec![compose_service("db", "app-db-1", &["app_default"])];
+
+        let selected = select_compose_container(&services, "app", "db", None)
+            .expect("single replica should be selected");
+
+        assert_eq!(selected.container, "app-db-1");
+    }
+
+    #[test]
+    fn selects_requested_container_among_replicas() {
+        let services = vec![
+            compose_service("db", "app-db-1", &["app_default"]),
+            compose_service("db", "app-db-2", &["app_default"]),
+        ];
+
+        let selected = select_compose_container(&services, "app", "db", Some("app-db-2"))
+            .expect("explicit replica should be selected");
+
+        assert_eq!(selected.container, "app-db-2");
+    }
+
+    #[test]
+    fn rejects_ambiguous_service_without_container() {
+        let services = vec![
+            compose_service("db", "app-db-1", &["app_default"]),
+            compose_service("db", "app-db-2", &["app_default"]),
+        ];
+
+        let error = select_compose_container(&services, "app", "db", None)
+            .expect_err("multiple replicas must require a container");
+
+        assert!(error.to_string().contains("app-db-1, app-db-2"));
+    }
+
+    #[test]
+    fn rejects_container_from_another_service() {
+        let services = vec![
+            compose_service("db", "app-db-1", &["app_default"]),
+            compose_service("cache", "app-cache-1", &["app_default"]),
+        ];
+
+        let error = select_compose_container(&services, "app", "db", Some("app-cache-1"))
+            .expect_err("container must belong to the requested service");
+
+        assert!(error.to_string().contains("does not belong to app/db"));
+    }
+
+    #[test]
+    fn network_resolution_prefers_project_default() {
+        let service = compose_service("api", "app-api-1", &["shared", "app_default"]);
+
+        assert_eq!(
+            resolve_network("app", &service, None).expect("default network should resolve"),
+            "app_default"
+        );
+    }
+
+    #[test]
+    fn network_resolution_rejects_unattached_requested_network() {
+        let service = compose_service("api", "app-api-1", &["app_default"]);
+
+        let error = resolve_network("app", &service, Some("private"))
+            .expect_err("unattached network must fail");
+
+        assert!(error
+            .to_string()
+            .contains("private is not attached to app-api-1"));
+    }
+
+    #[test]
+    fn network_resolution_lists_ambiguous_networks() {
+        let service = compose_service("api", "app-api-1", &["frontend", "backend"]);
+
+        let error = resolve_network("app", &service, None)
+            .expect_err("ambiguous networks must require selection");
+
+        assert!(error.to_string().contains("backend, frontend"));
     }
 }
