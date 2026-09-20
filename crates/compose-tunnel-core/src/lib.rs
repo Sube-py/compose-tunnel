@@ -848,15 +848,7 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
     let config = load_config().await?;
     let server = find_server(&config, &request.server)?.clone();
     let services = list_compose_services(request.server.clone(), request.project.clone()).await?;
-    let service = services
-        .iter()
-        .find(|item| item.service == request.service)
-        .ok_or_else(|| {
-            AppError::msg(format!(
-                "service {} was not found in project {}",
-                request.service, request.project
-            ))
-        })?;
+    let service = select_compose_container(&services, &request.project, &request.service, None)?;
     let network = resolve_network(&request.project, service, request.network.as_deref())?;
 
     let socat_port = request.socat_port.unwrap_or(request.target_port);
