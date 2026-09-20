@@ -2,7 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Output, Stdio},
+    time::Duration,
 };
 
 use directories::ProjectDirs;
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     process::{Child, Command},
+    time,
 };
 
 pub type Result<T> = std::result::Result<T, AppError>;
@@ -1234,6 +1236,64 @@ fn ssh_base_args(server: &ServerConfig) -> Vec<String> {
     args
 }
 
+fn format_forward_host(host: &str) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+fn ssh_forward_spec(
+    local_host: &str,
+    local_port: u16,
+    remote_host: &str,
+    remote_port: u16,
+) -> String {
+    format!(
+        "{}:{local_port}:{}:{remote_port}",
+        format_forward_host(local_host),
+        format_forward_host(remote_host)
+    )
+}
+
+fn ssh_forward_args(
+    server: &ServerConfig,
+    local_host: &str,
+    local_port: u16,
+    remote_host: &str,
+    remote_port: u16,
+) -> Result<Vec<String>> {
+    let mut args = ssh_base_args(server);
+    args.insert(0, "-N".to_string());
+    let forward = ssh_forward_spec(local_host, local_port, remote_host, remote_port);
+    let target_index = args
+        .iter()
+        .position(|value| value == &ssh_target(server))
+        .ok_or_else(|| AppError::msg("could not build ssh forward command"))?;
+    args.insert(target_index, "-L".to_string());
+    args.insert(target_index + 1, forward);
+    Ok(args)
+}
+
+async fn run_command_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    label: &str,
+) -> Result<Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    command.kill_on_drop(true);
+    match time::timeout(timeout, command.output()).await {
+        Ok(output) => Ok(output?),
+        Err(_) => Err(AppError::msg(format!(
+            "{label} timed out after {} seconds",
+            timeout.as_secs_f64()
+        ))),
+    }
+}
+
 async fn run_ssh(
     defaults: &Defaults,
     server: &ServerConfig,
@@ -1241,10 +1301,13 @@ async fn run_ssh(
 ) -> Result<String> {
     let mut args = ssh_base_args(server);
     args.push(remote_command.to_string());
-    let output = Command::new(&defaults.ssh_binary)
-        .args(args)
-        .output()
-        .await?;
+    let output = run_command_with_timeout(
+        &defaults.ssh_binary,
+        &args,
+        Duration::from_secs(defaults.docker_timeout_secs),
+        "ssh",
+    )
+    .await?;
     if !output.status.success() {
         return Err(AppError::msg(command_error(
             "ssh",
@@ -1263,22 +1326,22 @@ async fn spawn_ssh_forward(
     remote_host: &str,
     remote_port: u16,
 ) -> Result<Child> {
-    let mut args = ssh_base_args(server);
-    args.insert(0, "-N".to_string());
-    let forward = format!("{local_host}:{local_port}:{remote_host}:{remote_port}");
-    let target_index = args
-        .iter()
-        .position(|value| value == &ssh_target(server))
-        .ok_or_else(|| AppError::msg("could not build ssh forward command"))?;
-    args.insert(target_index, "-L".to_string());
-    args.insert(target_index + 1, forward);
+    let args = ssh_forward_args(server, local_host, local_port, remote_host, remote_port)?;
 
-    let child = Command::new(&defaults.ssh_binary)
+    let mut child = Command::new(&defaults.ssh_binary)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+
+    time::sleep(Duration::from_millis(250)).await;
+    if let Some(status) = child.try_wait()? {
+        return Err(AppError::msg(format!(
+            "ssh forward exited during startup with status {status}"
+        )));
+    }
+
     Ok(child)
 }
 
@@ -2906,5 +2969,65 @@ mod tests {
             .expect_err("missing Compose label must fail");
 
         assert!(error.to_string().contains("does not belong to app/db"));
+    }
+
+    #[test]
+    fn ssh_forward_spec_formats_ipv4_hosts() {
+        assert_eq!(
+            ssh_forward_spec("127.0.0.1", 15432, "172.22.0.4", 5432),
+            "127.0.0.1:15432:172.22.0.4:5432"
+        );
+    }
+
+    #[test]
+    fn ssh_forward_spec_brackets_ipv6_hosts() {
+        assert_eq!(
+            ssh_forward_spec("::1", 15432, "fd00::4", 5432),
+            "[::1]:15432:[fd00::4]:5432"
+        );
+    }
+
+    #[test]
+    fn ssh_forward_args_place_local_forward_before_target() {
+        let server = ServerConfig {
+            name: "staging".to_string(),
+            host: "staging.example.com".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            identity_file: None,
+            ssh_alias: None,
+            default_socat_image: None,
+            docker_command: "docker".to_string(),
+        };
+
+        let args = ssh_forward_args(&server, "127.0.0.1", 15432, "172.22.0.4", 5432)
+            .expect("forward args should build");
+        let forward_index = args
+            .iter()
+            .position(|value| value == "-L")
+            .expect("-L should be present");
+
+        assert_eq!(args[forward_index + 1], "127.0.0.1:15432:172.22.0.4:5432");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("deploy@staging.example.com")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_timeout_stops_a_slow_process() {
+        let args = vec!["-c".to_string(), "sleep 1".to_string()];
+
+        let error = run_command_with_timeout(
+            "sh",
+            &args,
+            std::time::Duration::from_millis(10),
+            "test command",
+        )
+        .await
+        .expect_err("slow command must time out");
+
+        assert!(error.to_string().contains("test command timed out"));
     }
 }
