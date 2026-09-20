@@ -69,10 +69,6 @@ impl Default for AppConfig {
 pub struct Defaults {
     #[serde(default = "default_local_host")]
     pub local_host: String,
-    #[serde(default = "default_socat_image")]
-    pub socat_image: String,
-    #[serde(default = "default_socat_command")]
-    pub socat_command: String,
     #[serde(default = "default_ssh_binary")]
     pub ssh_binary: String,
     #[serde(default = "default_docker_timeout_secs")]
@@ -83,8 +79,6 @@ impl Default for Defaults {
     fn default() -> Self {
         Self {
             local_host: default_local_host(),
-            socat_image: default_socat_image(),
-            socat_command: default_socat_command(),
             ssh_binary: default_ssh_binary(),
             docker_timeout_secs: default_docker_timeout_secs(),
         }
@@ -93,14 +87,6 @@ impl Default for Defaults {
 
 fn default_local_host() -> String {
     "127.0.0.1".to_string()
-}
-
-fn default_socat_image() -> String {
-    "alpine/socat:latest".to_string()
-}
-
-fn default_socat_command() -> String {
-    "socat".to_string()
 }
 
 fn default_ssh_binary() -> String {
@@ -122,8 +108,6 @@ pub struct ServerConfig {
     pub identity_file: Option<String>,
     #[serde(default)]
     pub ssh_alias: Option<String>,
-    #[serde(default)]
-    pub default_socat_image: Option<String>,
     #[serde(default = "default_docker_command")]
     pub docker_command: String,
 }
@@ -217,13 +201,13 @@ pub struct TunnelState {
     pub server: String,
     pub project: String,
     pub service: String,
+    pub container: String,
+    pub container_id: String,
+    pub container_ip: String,
     pub network: String,
     pub target_port: u16,
-    pub socat_port: u16,
     pub local_host: String,
     pub local_port: u16,
-    pub socat_container: String,
-    pub socat_container_ip: String,
     #[serde(default)]
     pub ssh_pid: Option<u32>,
     #[serde(default)]
@@ -239,13 +223,20 @@ pub struct TunnelState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TunnelMode {
-    SocatDirect,
+    ContainerDirect,
 }
 
 impl Default for TunnelMode {
     fn default() -> Self {
-        Self::SocatDirect
+        Self::ContainerDirect
     }
+}
+
+#[derive(Debug)]
+struct StateMigration {
+    state: AppState,
+    legacy_pids: Vec<u32>,
+    changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,15 +246,13 @@ pub struct OpenTunnelRequest {
     pub service: String,
     pub target_port: u16,
     #[serde(default)]
+    pub container: Option<String>,
+    #[serde(default)]
     pub network: Option<String>,
     #[serde(default)]
     pub local_port: Option<u16>,
     #[serde(default)]
     pub local_host: Option<String>,
-    #[serde(default)]
-    pub socat_port: Option<u16>,
-    #[serde(default)]
-    pub socat_image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,14 +283,7 @@ pub struct ComposeService {
 pub struct ServerTestResult {
     pub ssh_ok: bool,
     pub docker_ok: bool,
-    pub socat_image_ok: bool,
     pub details: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CleanupResult {
-    pub server: String,
-    pub containers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,7 +335,47 @@ pub async fn save_config(config: &AppConfig) -> Result<()> {
 pub async fn load_state() -> Result<AppState> {
     let paths = init_config().await?;
     let raw = fs::read_to_string(paths.state_file).await?;
-    Ok(serde_json::from_str(&raw)?)
+    let migration = parse_stored_state(&raw)?;
+    for pid in &migration.legacy_pids {
+        if pid_is_running(*pid) {
+            let _ = kill_pid(*pid).await;
+        }
+    }
+    if migration.changed {
+        save_state(&migration.state).await?;
+    }
+    Ok(migration.state)
+}
+
+fn parse_stored_state(raw: &str) -> Result<StateMigration> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let mut legacy_pids = Vec::new();
+    let mut changed = false;
+    let mut tunnels = Vec::new();
+
+    if let Some(rows) = value.get("tunnels") {
+        let rows = rows
+            .as_array()
+            .ok_or_else(|| AppError::msg("state tunnels must be an array"))?;
+        for row in rows {
+            if row.get("mode").and_then(|mode| mode.as_str()) == Some("socat-direct") {
+                if let Some(pid) = row.get("ssh_pid").and_then(serde_json::Value::as_u64) {
+                    if let Ok(pid) = u32::try_from(pid) {
+                        legacy_pids.push(pid);
+                    }
+                }
+                changed = true;
+                continue;
+            }
+            tunnels.push(serde_json::from_value(row.clone())?);
+        }
+    }
+
+    Ok(StateMigration {
+        state: AppState { tunnels },
+        legacy_pids,
+        changed,
+    })
 }
 
 pub async fn save_state(state: &AppState) -> Result<()> {
@@ -629,7 +651,12 @@ pub async fn clear_active_env_profile(target_dir: String) -> Result<PathBuf> {
     if config
         .active_env_profile
         .as_ref()
-        .and_then(|name| config.env_profiles.iter().find(|profile| &profile.name == name))
+        .and_then(|name| {
+            config
+                .env_profiles
+                .iter()
+                .find(|profile| &profile.name == name)
+        })
         .and_then(|profile| env_profile_target_key(profile).ok())
         .as_ref()
         == Some(&target_key)
@@ -653,7 +680,6 @@ pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
     let mut result = ServerTestResult {
         ssh_ok: false,
         docker_ok: false,
-        socat_image_ok: false,
         details: Vec::new(),
     };
 
@@ -681,30 +707,6 @@ pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
         }
         Err(error) => {
             result.details.push(format!("Docker check failed: {error}"));
-            return Ok(result);
-        }
-    }
-
-    let image = server
-        .default_socat_image
-        .as_ref()
-        .unwrap_or(&config.defaults.socat_image);
-    let image_cmd = format!(
-        "{docker} image inspect {} >/dev/null 2>&1 || {docker} pull {} >/dev/null",
-        shell_quote(image),
-        shell_quote(image)
-    );
-    match run_ssh(&config.defaults, &server, &image_cmd).await {
-        Ok(_) => {
-            result.socat_image_ok = true;
-            result
-                .details
-                .push(format!("socat image is available: {image}"));
-        }
-        Err(error) => {
-            result
-                .details
-                .push(format!("socat image check failed for {image}: {error}"));
         }
     }
 
@@ -850,10 +852,23 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
     let config = load_config().await?;
     let server = find_server(&config, &request.server)?.clone();
     let services = list_compose_services(request.server.clone(), request.project.clone()).await?;
-    let service = select_compose_container(&services, &request.project, &request.service, None)?;
-    let network = resolve_network(&request.project, service, request.network.as_deref())?;
+    let selected = select_compose_container(
+        &services,
+        &request.project,
+        &request.service,
+        request.container.as_deref(),
+    )?;
+    let network = resolve_network(&request.project, selected, request.network.as_deref())?;
+    let target = inspect_container(
+        &config.defaults,
+        &server,
+        &selected.container,
+        &request.project,
+        &request.service,
+        &network,
+    )
+    .await?;
 
-    let socat_port = request.socat_port.unwrap_or(request.target_port);
     let local_host = request
         .local_host
         .clone()
@@ -864,57 +879,32 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         &request.server,
         &request.project,
         &request.service,
-        request.target_port,
-    );
-    let local_port =
-        resolve_local_port(&existing_state, &tunnel_id, &local_host, request.local_port)?;
-    let image = request
-        .socat_image
-        .clone()
-        .or_else(|| server.default_socat_image.clone())
-        .unwrap_or_else(|| config.defaults.socat_image.clone());
-    let container = tunnel_container_name(
-        &server.name,
-        &request.project,
-        &request.service,
+        &target.container,
         request.target_port,
     );
 
-    ensure_socat_container(
-        &config.defaults,
-        &server,
-        &container,
-        &network,
-        &image,
-        &request.service,
-        request.target_port,
-        socat_port,
-    )
-    .await?;
-    let socat_container_ip =
-        match inspect_container_ip(&config.defaults, &server, &container, &network).await {
-            Ok(ip) => ip,
-            Err(error) => {
-                let _ = remove_socat_container(&config.defaults, &server, &container).await;
-                return Err(error);
-            }
-        };
-    let child = match spawn_ssh_forward(
+    if let Some(previous) = existing_state
+        .tunnels
+        .iter()
+        .find(|tunnel| tunnel.id == tunnel_id)
+    {
+        if let Some(pid) = previous.ssh_pid {
+            let _ = kill_pid(pid).await;
+        }
+        wait_for_local_port_release(&previous.local_host, previous.local_port).await?;
+    }
+
+    let local_port =
+        resolve_local_port(&existing_state, &tunnel_id, &local_host, request.local_port)?;
+    let child = spawn_ssh_forward(
         &config.defaults,
         &server,
         &local_host,
         local_port,
-        &socat_container_ip,
-        socat_port,
+        &target.ip,
+        request.target_port,
     )
-    .await
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = remove_socat_container(&config.defaults, &server, &container).await;
-            return Err(error);
-        }
-    };
+    .await?;
     let ssh_pid = child.id();
 
     let state = TunnelState {
@@ -922,16 +912,16 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         server: request.server.clone(),
         project: request.project.clone(),
         service: request.service.clone(),
+        container: target.container,
+        container_id: target.id,
+        container_ip: target.ip,
         network,
         target_port: request.target_port,
-        socat_port,
         local_host,
         local_port,
-        socat_container: container.clone(),
-        socat_container_ip,
         ssh_pid,
         status: TunnelStatus::Running,
-        mode: TunnelMode::SocatDirect,
+        mode: TunnelMode::ContainerDirect,
         started_at: Some(now_string()),
         last_error: None,
     };
@@ -940,7 +930,6 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
         if let Some(pid) = ssh_pid {
             let _ = kill_pid(pid).await;
         }
-        let _ = remove_socat_container(&config.defaults, &server, &container).await;
         return Err(error);
     }
     Ok(state)
@@ -948,7 +937,6 @@ pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
 
 pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
     let mut state = load_state().await?;
-    let config = load_config().await?;
     let mut changed = false;
 
     for tunnel in &mut state.tunnels {
@@ -957,9 +945,6 @@ pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
         }
         if let Some(pid) = tunnel.ssh_pid {
             kill_pid(pid).await?;
-        }
-        if let Ok(server) = find_server(&config, &tunnel.server) {
-            let _ = remove_socat_container(&config.defaults, server, &tunnel.socat_container).await;
         }
         tunnel.status = TunnelStatus::Stopped;
         tunnel.ssh_pid = None;
@@ -979,70 +964,6 @@ pub async fn close_all_tunnels() -> Result<()> {
         let _ = close_tunnel(tunnel.id).await;
     }
     Ok(())
-}
-
-pub async fn cleanup(server_id: String) -> Result<CleanupResult> {
-    let (config, server, containers) = cleanup_container_candidates(&server_id).await?;
-
-    if !containers.is_empty() {
-        let joined = containers
-            .iter()
-            .map(|container| shell_quote(container))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let command = format!("{} rm -f {joined}", docker_command(&server));
-        run_ssh(&config.defaults, &server, &command).await?;
-    }
-
-    Ok(CleanupResult {
-        server: server_id,
-        containers,
-    })
-}
-
-pub async fn preview_cleanup(server_id: String) -> Result<CleanupResult> {
-    let (_, _, containers) = cleanup_container_candidates(&server_id).await?;
-
-    Ok(CleanupResult {
-        server: server_id,
-        containers,
-    })
-}
-
-async fn cleanup_container_candidates(
-    server_id: &str,
-) -> Result<(AppConfig, ServerConfig, Vec<String>)> {
-    let config = load_config().await?;
-    let server = find_server(&config, server_id)?.clone();
-    let list_command = managed_container_list_command(&docker_command(&server));
-    let output = run_ssh(&config.defaults, &server, &list_command).await?;
-    let containers: Vec<String> = output
-        .lines()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    let state = load_refreshed_state().await?;
-    let containers = cleanup_candidates(containers, &state, server_id);
-    Ok((config, server, containers))
-}
-
-fn managed_container_list_command(docker: &str) -> String {
-    format!("{docker} ps -a --filter label=compose-tunnel.managed=true --format '{{{{.Names}}}}'")
-}
-
-fn cleanup_candidates(containers: Vec<String>, state: &AppState, server_id: &str) -> Vec<String> {
-    let active: BTreeSet<&str> = state
-        .tunnels
-        .iter()
-        .filter(|tunnel| tunnel.server == server_id && tunnel.status == TunnelStatus::Running)
-        .map(|tunnel| tunnel.socat_container.as_str())
-        .collect();
-
-    containers
-        .into_iter()
-        .filter(|container| !active.contains(container.as_str()))
-        .collect()
 }
 
 pub async fn render_env_profile(name: String, target_dir: Option<String>) -> Result<String> {
@@ -1345,39 +1266,6 @@ async fn spawn_ssh_forward(
     Ok(child)
 }
 
-async fn ensure_socat_container(
-    defaults: &Defaults,
-    server: &ServerConfig,
-    container: &str,
-    network: &str,
-    image: &str,
-    service: &str,
-    target_port: u16,
-    socat_port: u16,
-) -> Result<()> {
-    let docker = docker_command(server);
-    let inspect_command = format!(
-        "{docker} inspect {} >/dev/null 2>&1",
-        shell_quote(container)
-    );
-    if run_ssh(defaults, server, &inspect_command).await.is_ok() {
-        return Ok(());
-    }
-
-    let listen = format!("TCP-LISTEN:{socat_port},fork,reuseaddr");
-    let target = format!("TCP:{service}:{target_port}");
-    let command = format!(
-        "{docker} run -d --rm --label compose-tunnel.managed=true --name {} --network {} {} {} {}",
-        shell_quote(container),
-        shell_quote(network),
-        shell_quote(image),
-        shell_quote(&listen),
-        shell_quote(&target)
-    );
-    run_ssh(defaults, server, &command).await?;
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 struct DockerInspectContainer {
     #[serde(rename = "Id")]
@@ -1497,43 +1385,6 @@ async fn inspect_container(
     parse_inspected_container(&output, container, project, service, network)
 }
 
-async fn inspect_container_ip(
-    defaults: &Defaults,
-    server: &ServerConfig,
-    container: &str,
-    network: &str,
-) -> Result<String> {
-    let docker = docker_command(server);
-    let command = format!(
-        "{docker} inspect -f {} {}",
-        shell_quote(&format!(
-            "{{{{ index .NetworkSettings.Networks \"{network}\" \"IPAddress\" }}}}"
-        )),
-        shell_quote(container)
-    );
-    let output = run_ssh(defaults, server, &command).await?;
-    let ip = output.trim();
-    if ip.is_empty() || ip == "<no value>" {
-        return Err(AppError::msg(format!(
-            "could not inspect container IP for {container} on network {network}"
-        )));
-    }
-    Ok(ip.to_string())
-}
-
-async fn remove_socat_container(
-    defaults: &Defaults,
-    server: &ServerConfig,
-    container: &str,
-) -> Result<()> {
-    let command = format!(
-        "{} rm -f {} >/dev/null 2>&1 || true",
-        docker_command(server),
-        shell_quote(container)
-    );
-    run_ssh(defaults, server, &command).await.map(|_| ())
-}
-
 fn resolve_network(
     project: &str,
     container: &ComposeService,
@@ -1588,6 +1439,16 @@ fn local_port_available(host: &str, port: u16) -> bool {
     TcpListener::bind((host, port)).is_ok()
 }
 
+async fn wait_for_local_port_release(host: &str, port: u16) -> Result<()> {
+    for _ in 0..20 {
+        if local_port_available(host, port) {
+            return Ok(());
+        }
+        time::sleep(Duration::from_millis(25)).await;
+    }
+    ensure_local_port_available(host, port)
+}
+
 fn resolve_local_port(
     state: &AppState,
     tunnel_id: &str,
@@ -1610,34 +1471,28 @@ fn resolve_local_port(
     }
 }
 
-fn tunnel_container_name(server: &str, project: &str, service: &str, target_port: u16) -> String {
-    format!(
-        "compose-tunnel-{}-{}-{}-{}",
-        sanitize_name(server),
-        sanitize_name(project),
-        sanitize_name(service),
-        target_port
-    )
-}
-
 fn tunnel_state_id(
     state: &AppState,
     server: &str,
     project: &str,
     service: &str,
+    container: &str,
     target_port: u16,
 ) -> String {
     let base = service.to_string();
     match state.tunnels.iter().find(|tunnel| tunnel.id == base) {
         None => base,
-        Some(existing) if same_tunnel_target(existing, server, project, service, target_port) => {
+        Some(existing)
+            if same_tunnel_target(existing, server, project, service, container, target_port) =>
+        {
             base
         }
         Some(_) => format!(
-            "{}-{}-{}-{}",
+            "{}-{}-{}-{}-{}",
             sanitize_name(server),
             sanitize_name(project),
             sanitize_name(service),
+            sanitize_name(container),
             target_port
         ),
     }
@@ -1648,11 +1503,13 @@ fn same_tunnel_target(
     server: &str,
     project: &str,
     service: &str,
+    container: &str,
     target_port: u16,
 ) -> bool {
     tunnel.server == server
         && tunnel.project == project
         && tunnel.service == service
+        && tunnel.container == container
         && tunnel.target_port == target_port
 }
 
@@ -1723,7 +1580,7 @@ fn render_env_profile_at(
         lines.push(format!("#   server: {}", tunnel.server));
         lines.push(format!("#   project: {}", tunnel.project));
         lines.push(format!("#   service: {}", tunnel.service));
-        lines.push(format!("#   container: {}", tunnel.socat_container));
+        lines.push(format!("#   container: {}", tunnel.container));
         lines.push(format!("#   remote_port: {}", tunnel.target_port));
         lines.push(format!(
             "#   local: {}:{}",
@@ -1753,9 +1610,7 @@ fn render_env_profile_at(
 }
 
 fn local_timestamp_string() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn resolve_env_profile_value(value: &str, port_values: &BTreeMap<String, String>) -> String {
@@ -2032,6 +1887,92 @@ fn now_string() -> String {
 mod tests {
     use super::*;
 
+    fn direct_tunnel(status: TunnelStatus) -> TunnelState {
+        TunnelState {
+            id: "db".to_string(),
+            server: "staging".to_string(),
+            project: "app".to_string(),
+            service: "db".to_string(),
+            container: "app-db-1".to_string(),
+            container_id: "sha256:abc123".to_string(),
+            container_ip: "172.22.0.4".to_string(),
+            network: "app_default".to_string(),
+            target_port: 5432,
+            local_host: "127.0.0.1".to_string(),
+            local_port: 15432,
+            ssh_pid: Some(1234),
+            status,
+            mode: TunnelMode::ContainerDirect,
+            started_at: Some("2026-09-20T12:00:00Z".to_string()),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn legacy_socat_state_is_discarded_and_returns_its_pid() {
+        let raw = r#"{
+          "tunnels": [{
+            "id": "db",
+            "server": "staging",
+            "project": "app",
+            "service": "db",
+            "network": "app_default",
+            "target_port": 5432,
+            "socat_port": 5432,
+            "local_host": "127.0.0.1",
+            "local_port": 15432,
+            "socat_container": "compose-tunnel-staging-app-db-5432",
+            "socat_container_ip": "172.22.0.9",
+            "ssh_pid": 4242,
+            "status": "running",
+            "mode": "socat-direct"
+          }]
+        }"#;
+
+        let migration = parse_stored_state(raw).expect("legacy state should migrate");
+
+        assert!(migration.state.tunnels.is_empty());
+        assert_eq!(migration.legacy_pids, vec![4242]);
+        assert!(migration.changed);
+    }
+
+    #[test]
+    fn tunnel_id_distinguishes_service_replicas() {
+        let state = AppState {
+            tunnels: vec![direct_tunnel(TunnelStatus::Stopped)],
+        };
+
+        assert_eq!(
+            tunnel_state_id(&state, "staging", "app", "db", "app-db-2", 5432),
+            "staging-app-db-app-db-2-5432"
+        );
+    }
+
+    #[test]
+    fn old_socat_config_keys_are_ignored_when_reserialized() {
+        let raw = r#"
+            [defaults]
+            local_host = "127.0.0.1"
+            socat_image = "alpine/socat:latest"
+            socat_command = "socat"
+            ssh_binary = "ssh"
+            docker_timeout_secs = 20
+
+            [[servers]]
+            name = "staging"
+            host = "example.com"
+            port = 22
+            user = "deploy"
+            default_socat_image = "alpine/socat:latest"
+            docker_command = "docker"
+        "#;
+
+        let config: AppConfig = toml::from_str(raw).expect("old config should load");
+        let serialized = toml::to_string(&config).expect("new config should serialize");
+
+        assert!(!serialized.contains("socat"));
+    }
+
     #[test]
     fn env_profile_names_are_scoped_to_target_directory() {
         let config = AppConfig {
@@ -2092,7 +2033,10 @@ mod tests {
     fn ssh_config_value_reads_resolved_property() {
         let config = "host staging\nuser deploy\nhostname 10.0.0.5\nport 2202\n";
 
-        assert_eq!(ssh_config_value(config, "hostname").as_deref(), Some("10.0.0.5"));
+        assert_eq!(
+            ssh_config_value(config, "hostname").as_deref(),
+            Some("10.0.0.5")
+        );
         assert_eq!(ssh_config_value(config, "user").as_deref(), Some("deploy"));
         assert_eq!(ssh_config_value(config, "port").as_deref(), Some("2202"));
     }
@@ -2199,94 +2143,9 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_lists_only_managed_labeled_containers() {
-        let command = managed_container_list_command("sudo -n docker");
-
-        assert!(command.contains("sudo -n docker ps -a"));
-        assert!(command.contains("--filter label=compose-tunnel.managed=true"));
-        assert!(!command.contains("--filter name="));
-    }
-
-    #[test]
-    fn cleanup_skips_running_tunnel_containers_for_server() {
-        let state = AppState {
-            tunnels: vec![
-                TunnelState {
-                    id: "db".to_string(),
-                    server: "staging".to_string(),
-                    project: "app".to_string(),
-                    service: "db".to_string(),
-                    network: "app_default".to_string(),
-                    target_port: 5432,
-                    socat_port: 5432,
-                    local_host: "127.0.0.1".to_string(),
-                    local_port: 15432,
-                    socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-                    socat_container_ip: "172.18.0.20".to_string(),
-                    ssh_pid: Some(1234),
-                    status: TunnelStatus::Running,
-                    mode: TunnelMode::SocatDirect,
-                    started_at: None,
-                    last_error: None,
-                },
-                TunnelState {
-                    id: "redis".to_string(),
-                    server: "staging".to_string(),
-                    project: "app".to_string(),
-                    service: "redis".to_string(),
-                    network: "app_default".to_string(),
-                    target_port: 6379,
-                    socat_port: 6379,
-                    local_host: "127.0.0.1".to_string(),
-                    local_port: 16379,
-                    socat_container: "compose-tunnel-staging-app-redis-6379".to_string(),
-                    socat_container_ip: "172.18.0.21".to_string(),
-                    ssh_pid: None,
-                    status: TunnelStatus::Stopped,
-                    mode: TunnelMode::SocatDirect,
-                    started_at: None,
-                    last_error: None,
-                },
-            ],
-        };
-        let containers = vec![
-            "compose-tunnel-staging-app-db-5432".to_string(),
-            "compose-tunnel-staging-app-redis-6379".to_string(),
-            "compose-tunnel-orphan".to_string(),
-        ];
-
-        let candidates = cleanup_candidates(containers, &state, "staging");
-
-        assert_eq!(
-            candidates,
-            vec![
-                "compose-tunnel-staging-app-redis-6379".to_string(),
-                "compose-tunnel-orphan".to_string()
-            ]
-        );
-    }
-
-    #[test]
     fn refresh_tunnel_status_marks_dead_ssh_process_as_stopped() {
         let mut state = AppState {
-            tunnels: vec![TunnelState {
-                id: "db".to_string(),
-                server: "staging".to_string(),
-                project: "app".to_string(),
-                service: "db".to_string(),
-                network: "app_default".to_string(),
-                target_port: 5432,
-                socat_port: 5432,
-                local_host: "127.0.0.1".to_string(),
-                local_port: 15432,
-                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-                socat_container_ip: "172.18.0.20".to_string(),
-                ssh_pid: Some(1234),
-                status: TunnelStatus::Running,
-                mode: TunnelMode::SocatDirect,
-                started_at: None,
-                last_error: None,
-            }],
+            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
         };
 
         let changed = refresh_tunnel_process_statuses(&mut state, |_| false);
@@ -2303,24 +2162,7 @@ mod tests {
     #[test]
     fn refresh_tunnel_status_keeps_live_ssh_process_running() {
         let mut state = AppState {
-            tunnels: vec![TunnelState {
-                id: "db".to_string(),
-                server: "staging".to_string(),
-                project: "app".to_string(),
-                service: "db".to_string(),
-                network: "app_default".to_string(),
-                target_port: 5432,
-                socat_port: 5432,
-                local_host: "127.0.0.1".to_string(),
-                local_port: 15432,
-                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-                socat_container_ip: "172.18.0.20".to_string(),
-                ssh_pid: Some(1234),
-                status: TunnelStatus::Running,
-                mode: TunnelMode::SocatDirect,
-                started_at: None,
-                last_error: None,
-            }],
+            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
         };
 
         let changed = refresh_tunnel_process_statuses(&mut state, |_| true);
@@ -2334,25 +2176,9 @@ mod tests {
     #[test]
     fn refresh_tunnel_status_marks_running_without_pid_as_error() {
         let mut state = AppState {
-            tunnels: vec![TunnelState {
-                id: "db".to_string(),
-                server: "staging".to_string(),
-                project: "app".to_string(),
-                service: "db".to_string(),
-                network: "app_default".to_string(),
-                target_port: 5432,
-                socat_port: 5432,
-                local_host: "127.0.0.1".to_string(),
-                local_port: 15432,
-                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-                socat_container_ip: "172.18.0.20".to_string(),
-                ssh_pid: None,
-                status: TunnelStatus::Running,
-                mode: TunnelMode::SocatDirect,
-                started_at: None,
-                last_error: None,
-            }],
+            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
         };
+        state.tunnels[0].ssh_pid = None;
 
         let changed = refresh_tunnel_process_statuses(&mut state, |_| true);
 
@@ -2367,51 +2193,26 @@ mod tests {
     #[test]
     fn tunnel_id_scopes_when_service_id_already_belongs_to_another_target() {
         let state = AppState {
-            tunnels: vec![TunnelState {
-                id: "db".to_string(),
-                server: "staging".to_string(),
-                project: "app".to_string(),
-                service: "db".to_string(),
-                network: "app_default".to_string(),
-                target_port: 5432,
-                socat_port: 5432,
-                local_host: "127.0.0.1".to_string(),
-                local_port: 15432,
-                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-                socat_container_ip: "172.18.0.20".to_string(),
-                ssh_pid: Some(1234),
-                status: TunnelStatus::Running,
-                mode: TunnelMode::SocatDirect,
-                started_at: None,
-                last_error: None,
-            }],
+            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
         };
 
-        assert_eq!(tunnel_state_id(&state, "staging", "app", "db", 5432), "db");
         assert_eq!(
-            tunnel_state_id(&state, "staging", "billing", "db", 5432),
-            "staging-billing-db-5432"
+            tunnel_state_id(&state, "staging", "app", "db", "app-db-1", 5432),
+            "db"
+        );
+        assert_eq!(
+            tunnel_state_id(&state, "staging", "billing", "db", "app-db-1", 5432),
+            "staging-billing-db-app-db-1-5432"
         );
     }
 
     fn stopped_tunnel_with_local_port(id: &str, local_port: u16) -> TunnelState {
         TunnelState {
             id: id.to_string(),
-            server: "staging".to_string(),
-            project: "app".to_string(),
-            service: "db".to_string(),
-            network: "app_default".to_string(),
-            target_port: 5432,
-            socat_port: 5432,
-            local_host: "127.0.0.1".to_string(),
             local_port,
-            socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-            socat_container_ip: "172.18.0.20".to_string(),
-            ssh_pid: None,
             status: TunnelStatus::Stopped,
-            mode: TunnelMode::SocatDirect,
-            started_at: None,
-            last_error: None,
+            ssh_pid: None,
+            ..direct_tunnel(TunnelStatus::Stopped)
         }
     }
 
@@ -2493,28 +2294,11 @@ mod tests {
             }],
         };
         let state = AppState {
-            tunnels: vec![TunnelState {
-                id: "db".to_string(),
-                server: "staging".to_string(),
-                project: "app".to_string(),
-                service: "db".to_string(),
-                network: "app_default".to_string(),
-                target_port: 5432,
-                socat_port: 5432,
-                local_host: "127.0.0.1".to_string(),
-                local_port: 15432,
-                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-                socat_container_ip: "172.18.0.20".to_string(),
-                ssh_pid: None,
-                status: TunnelStatus::Running,
-                mode: TunnelMode::SocatDirect,
-                started_at: None,
-                last_error: None,
-            }],
+            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
         };
 
-        let rendered =
-            render_env_profile_at(&profile, &state, "2026-07-21 16:30:45").expect("profile should render");
+        let rendered = render_env_profile_at(&profile, &state, "2026-07-21 16:30:45")
+            .expect("profile should render");
 
         assert!(rendered.contains("# compose-tunnel env: test"));
         assert!(rendered.contains("# created_at: 2026-07-21 16:30:45"));
@@ -2522,7 +2306,7 @@ mod tests {
         assert!(rendered.contains("#   server: staging"));
         assert!(rendered.contains("#   project: app"));
         assert!(rendered.contains("#   service: db"));
-        assert!(rendered.contains("#   container: compose-tunnel-staging-app-db-5432"));
+        assert!(rendered.contains("#   container: app-db-1"));
         assert!(rendered.contains("#   remote_port: 5432"));
         assert!(rendered.contains("#   local: 127.0.0.1:15432"));
         assert!(rendered.contains("server_db=15432"));
@@ -2556,28 +2340,11 @@ mod tests {
             ],
         };
         let state = AppState {
-            tunnels: vec![TunnelState {
-                id: "db".to_string(),
-                server: "staging".to_string(),
-                project: "app".to_string(),
-                service: "db".to_string(),
-                network: "app_default".to_string(),
-                target_port: 5432,
-                socat_port: 5432,
-                local_host: "127.0.0.1".to_string(),
-                local_port: 15432,
-                socat_container: "compose-tunnel-staging-app-db-5432".to_string(),
-                socat_container_ip: "172.18.0.20".to_string(),
-                ssh_pid: None,
-                status: TunnelStatus::Running,
-                mode: TunnelMode::SocatDirect,
-                started_at: None,
-                last_error: None,
-            }],
+            tunnels: vec![direct_tunnel(TunnelStatus::Running)],
         };
 
-        let rendered =
-            render_env_profile_at(&profile, &state, "2026-07-21 16:30:45").expect("profile should render");
+        let rendered = render_env_profile_at(&profile, &state, "2026-07-21 16:30:45")
+            .expect("profile should render");
 
         assert!(rendered.contains("server_name_container_name=15432"));
         assert!(rendered.contains("DATABASE_PORT=15432"));
@@ -2996,7 +2763,6 @@ mod tests {
             user: "deploy".to_string(),
             identity_file: None,
             ssh_alias: None,
-            default_socat_image: None,
             docker_command: "docker".to_string(),
         };
 

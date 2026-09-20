@@ -28,9 +28,7 @@ pub fn run() {
             commands::close_all_tunnels,
             commands::list_tunnels,
             commands::render_env_profile,
-            commands::write_env_profile,
-            commands::cleanup,
-            commands::preview_cleanup
+            commands::write_env_profile
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

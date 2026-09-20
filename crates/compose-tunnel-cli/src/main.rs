@@ -5,11 +5,11 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use compose_tunnel_core::{
-    active_env_profiles, cleanup, close_all_tunnels, close_tunnel, delete_env_profile,
-    delete_server, init_config, list_compose_projects, list_compose_services, list_env_profiles,
-    list_servers, list_tunnels, open_tunnel, preview_cleanup, render_env_profile, save_env_profile,
-    save_server, set_active_env_profile, test_server, write_env_profile, EnvPlainEntry,
-    EnvProfileConfig, EnvTunnelPort, OpenTunnelRequest, ServerConfig, WriteEnvProfileRequest,
+    active_env_profiles, close_all_tunnels, close_tunnel, delete_env_profile, delete_server,
+    init_config, list_compose_projects, list_compose_services, list_env_profiles, list_servers,
+    list_tunnels, open_tunnel, render_env_profile, save_env_profile, save_server,
+    set_active_env_profile, test_server, write_env_profile, EnvPlainEntry, EnvProfileConfig,
+    EnvTunnelPort, OpenTunnelRequest, ServerConfig, WriteEnvProfileRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -33,7 +33,6 @@ enum Command {
     },
     Open(OpenArgs),
     Close(CloseArgs),
-    Cleanup(CleanupArgs),
     Status,
     Env(EnvArgs),
 }
@@ -59,8 +58,6 @@ struct ServerAddArgs {
     identity_file: Option<String>,
     #[arg(long)]
     ssh_alias: Option<String>,
-    #[arg(long)]
-    socat_image: Option<String>,
     #[arg(long, default_value = "docker")]
     docker_command: String,
 }
@@ -95,6 +92,8 @@ struct OpenArgs {
     #[arg(long)]
     service: String,
     #[arg(long)]
+    container: Option<String>,
+    #[arg(long)]
     target_port: u16,
     #[arg(long)]
     network: Option<String>,
@@ -102,10 +101,6 @@ struct OpenArgs {
     local_port: Option<u16>,
     #[arg(long)]
     local_host: Option<String>,
-    #[arg(long)]
-    socat_port: Option<u16>,
-    #[arg(long)]
-    socat_image: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -113,18 +108,6 @@ struct CloseArgs {
     tunnel_id: Option<String>,
     #[arg(long)]
     all: bool,
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Debug, Args)]
-struct CleanupArgs {
-    #[arg(long)]
-    server: String,
-    #[arg(long)]
-    dry_run: bool,
-    #[arg(long)]
-    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -197,11 +180,10 @@ async fn main() -> anyhow::Result<()> {
                 project: args.project,
                 service: args.service,
                 target_port: args.target_port,
+                container: args.container,
                 network: args.network,
                 local_port: args.local_port,
                 local_host: args.local_host,
-                socat_port: args.socat_port,
-                socat_image: args.socat_image,
             })
             .await?;
             println!("Tunnel started\n");
@@ -209,27 +191,20 @@ async fn main() -> anyhow::Result<()> {
                 "Service:          {}/{}:{}",
                 tunnel.project, tunnel.service, tunnel.target_port
             );
+            println!("Container:        {}", tunnel.container);
+            println!("Network:          {}", tunnel.network);
+            println!(
+                "Forward target:   {}:{}",
+                tunnel.container_ip, tunnel.target_port
+            );
             println!(
                 "Local:            {}:{}",
                 tunnel.local_host, tunnel.local_port
             );
-            println!(
-                "Forward target:   {}:{}",
-                tunnel.socat_container_ip, tunnel.socat_port
-            );
-            println!("Mode:             socat-direct");
+            println!("Mode:             container-direct");
         }
         Command::Close(args) => {
             if args.all {
-                if !args.yes
-                    && !confirm_dangerous_action(
-                        "close --all requires --yes when stdin is not interactive",
-                        "Stop all tunnels and remove their remote socat containers? [y/N] ",
-                    )?
-                {
-                    println!("Close all cancelled");
-                    return Ok(());
-                }
                 close_all_tunnels().await?;
                 println!("All tunnels stopped");
             } else if let Some(tunnel_id) = args.tunnel_id {
@@ -239,54 +214,16 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("pass a tunnel id or --all");
             }
         }
-        Command::Cleanup(args) => {
-            if args.dry_run {
-                let result = preview_cleanup(args.server).await?;
-                if result.containers.is_empty() {
-                    println!("No compose-tunnel containers found on {}", result.server);
-                    return Ok(());
-                }
-                println!("Containers that would be removed on {}:", result.server);
-                for container in result.containers {
-                    println!("  {container}");
-                }
-                return Ok(());
-            }
-
-            let preview = preview_cleanup(args.server.clone()).await?;
-            if preview.containers.is_empty() {
-                println!("No compose-tunnel containers found on {}", preview.server);
-                return Ok(());
-            }
-            println!("Containers to remove on {}:", preview.server);
-            for container in &preview.containers {
-                println!("  {container}");
-            }
-            if !args.yes
-                && !confirm_dangerous_action(
-                    "cleanup requires --yes when stdin is not interactive",
-                    "Remove these remote containers? [y/N] ",
-                )?
-            {
-                println!("Cleanup cancelled");
-                return Ok(());
-            }
-
-            let result = cleanup(args.server).await?;
-            println!("Removed containers on {}:", result.server);
-            for container in result.containers {
-                println!("  {container}");
-            }
-        }
         Command::Status => {
-            println!("ID\tSERVER\tPROJECT\tSERVICE\tLOCAL\tMODE\tSTATUS");
+            println!("ID\tSERVER\tPROJECT\tSERVICE\tCONTAINER\tLOCAL\tMODE\tSTATUS");
             for tunnel in list_tunnels().await? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}:{}\tsocat-direct\t{:?}",
+                    "{}\t{}\t{}\t{}\t{}\t{}:{}\tcontainer-direct\t{:?}",
                     tunnel.id,
                     tunnel.server,
                     tunnel.project,
                     tunnel.service,
+                    tunnel.container,
                     tunnel.local_host,
                     tunnel.local_port,
                     tunnel.status
@@ -504,7 +441,6 @@ async fn handle_server(command: ServerCommand) -> anyhow::Result<()> {
                 user: args.user,
                 identity_file: args.identity_file,
                 ssh_alias: args.ssh_alias,
-                default_socat_image: args.socat_image,
                 docker_command: args.docker_command,
             })
             .await?;
@@ -528,7 +464,6 @@ async fn handle_server(command: ServerCommand) -> anyhow::Result<()> {
             let result = test_server(name).await?;
             println!("SSH:          {}", ok_text(result.ssh_ok));
             println!("Docker:       {}", ok_text(result.docker_ok));
-            println!("socat image:  {}", ok_text(result.socat_image_ok));
             for detail in result.details {
                 println!("  {detail}");
             }
@@ -594,6 +529,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_open_with_concrete_container() {
+        let cli = Cli::try_parse_from([
+            "compose-tunnel",
+            "open",
+            "--server",
+            "staging",
+            "--project",
+            "app",
+            "--service",
+            "db",
+            "--container",
+            "app-db-2",
+            "--target-port",
+            "5432",
+        ])
+        .expect("direct container open should parse");
+
+        let Command::Open(args) = cli.command else {
+            panic!("expected open command");
+        };
+        assert_eq!(args.container.as_deref(), Some("app-db-2"));
+    }
+
+    #[test]
+    fn rejects_removed_cleanup_command() {
+        assert!(Cli::try_parse_from(["compose-tunnel", "cleanup", "--server", "staging"]).is_err());
+    }
+
+    #[test]
+    fn rejects_removed_socat_open_flags() {
+        assert!(Cli::try_parse_from([
+            "compose-tunnel",
+            "open",
+            "--server",
+            "staging",
+            "--project",
+            "app",
+            "--service",
+            "db",
+            "--target-port",
+            "5432",
+            "--socat-image",
+            "alpine/socat:latest",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn close_all_no_longer_accepts_yes_flag() {
+        assert!(Cli::try_parse_from(["compose-tunnel", "close", "--all", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["compose-tunnel", "close", "--all"]).is_ok());
+    }
+
+    #[test]
     fn parses_tunnel_port_binding_with_env_key() {
         let binding =
             parse_env_tunnel_port("db:staging_db:DATABASE_PORT").expect("binding should parse");
@@ -635,40 +624,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_cleanup_dry_run() {
-        let cli = Cli::try_parse_from([
-            "compose-tunnel",
-            "cleanup",
-            "--server",
-            "staging",
-            "--dry-run",
-        ])
-        .expect("cleanup dry run should parse");
-
-        match cli.command {
-            Command::Cleanup(args) => {
-                assert_eq!(args.server, "staging");
-                assert!(args.dry_run);
-            }
-            _ => panic!("expected cleanup command"),
-        }
-    }
-
-    #[test]
-    fn parses_close_all_yes() {
-        let cli = Cli::try_parse_from(["compose-tunnel", "close", "--all", "--yes"])
-            .expect("close all yes should parse");
-
-        match cli.command {
-            Command::Close(args) => {
-                assert!(args.all);
-                assert!(args.yes);
-            }
-            _ => panic!("expected close command"),
-        }
-    }
-
-    #[test]
     fn parses_server_delete_yes() {
         let cli = Cli::try_parse_from(["compose-tunnel", "server", "delete", "staging", "--yes"])
             .expect("server delete yes should parse");
@@ -681,22 +636,6 @@ mod tests {
                 assert!(args.yes);
             }
             _ => panic!("expected server delete command"),
-        }
-    }
-
-    #[test]
-    fn parses_cleanup_yes() {
-        let cli =
-            Cli::try_parse_from(["compose-tunnel", "cleanup", "--server", "staging", "--yes"])
-                .expect("cleanup yes should parse");
-
-        match cli.command {
-            Command::Cleanup(args) => {
-                assert_eq!(args.server, "staging");
-                assert!(args.yes);
-                assert!(!args.dry_run);
-            }
-            _ => panic!("expected cleanup command"),
         }
     }
 
