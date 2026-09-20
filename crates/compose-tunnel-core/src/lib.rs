@@ -1315,6 +1315,125 @@ async fn ensure_socat_container(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct DockerInspectContainer {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "State")]
+    state: DockerInspectState,
+    #[serde(rename = "Config")]
+    config: DockerInspectConfig,
+    #[serde(rename = "NetworkSettings")]
+    network_settings: DockerInspectNetworkSettings,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerInspectState {
+    #[serde(rename = "Running")]
+    running: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerInspectConfig {
+    #[serde(rename = "Labels", default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerInspectNetworkSettings {
+    #[serde(rename = "Networks", default)]
+    networks: BTreeMap<String, DockerInspectNetwork>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerInspectNetwork {
+    #[serde(rename = "IPAddress", default)]
+    ipv4: String,
+    #[serde(rename = "GlobalIPv6Address", default)]
+    ipv6: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InspectedContainer {
+    container: String,
+    id: String,
+    network: String,
+    ip: String,
+}
+
+fn parse_inspected_container(
+    raw: &str,
+    container: &str,
+    project: &str,
+    service: &str,
+    network: &str,
+) -> Result<InspectedContainer> {
+    let mut containers: Vec<DockerInspectContainer> = serde_json::from_str(raw)?;
+    if containers.len() != 1 {
+        return Err(AppError::msg(format!(
+            "expected exactly one container for {container}, got {}",
+            containers.len()
+        )));
+    }
+
+    let inspected = containers.remove(0);
+    if !inspected.state.running {
+        return Err(AppError::msg(format!("{container} is not running")));
+    }
+
+    let project_label = inspected.config.labels.get("com.docker.compose.project");
+    let service_label = inspected.config.labels.get("com.docker.compose.service");
+    if project_label.map(String::as_str) != Some(project)
+        || service_label.map(String::as_str) != Some(service)
+    {
+        return Err(AppError::msg(format!(
+            "container {container} does not belong to {project}/{service}"
+        )));
+    }
+
+    let attached = inspected
+        .network_settings
+        .networks
+        .get(network)
+        .ok_or_else(|| {
+            AppError::msg(format!("network {network} is not attached to {container}"))
+        })?;
+    let ip = if attached.ipv4.trim().is_empty() {
+        attached.ipv6.trim()
+    } else {
+        attached.ipv4.trim()
+    };
+    if ip.is_empty() {
+        return Err(AppError::msg(format!(
+            "container {container} has no IP address on network {network}"
+        )));
+    }
+
+    Ok(InspectedContainer {
+        container: container.to_string(),
+        id: inspected.id,
+        network: network.to_string(),
+        ip: ip.to_string(),
+    })
+}
+
+async fn inspect_container(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    container: &str,
+    project: &str,
+    service: &str,
+    network: &str,
+) -> Result<InspectedContainer> {
+    let command = format!(
+        "{} inspect --type container {}",
+        docker_command(server),
+        shell_quote(container)
+    );
+    let output = run_ssh(defaults, server, &command).await?;
+    parse_inspected_container(&output, container, project, service, network)
+}
+
 async fn inspect_container_ip(
     defaults: &Defaults,
     server: &ServerConfig,
@@ -2667,5 +2786,125 @@ mod tests {
             .expect_err("ambiguous networks must require selection");
 
         assert!(error.to_string().contains("backend, frontend"));
+    }
+
+    const RUNNING_INSPECT: &str = r#"[
+  {
+    "Id": "sha256:abc123",
+    "Name": "/app-db-1",
+    "State": { "Running": true },
+    "Config": {
+      "Labels": {
+        "com.docker.compose.project": "app",
+        "com.docker.compose.service": "db"
+      }
+    },
+    "NetworkSettings": {
+      "Networks": {
+        "app_default": {
+          "IPAddress": "172.22.0.4",
+          "GlobalIPv6Address": "fd00::4"
+        }
+      }
+    }
+  }
+]"#;
+
+    #[test]
+    fn parses_running_container_and_prefers_ipv4() {
+        let target =
+            parse_inspected_container(RUNNING_INSPECT, "app-db-1", "app", "db", "app_default")
+                .expect("inspect result should parse");
+
+        assert_eq!(target.container, "app-db-1");
+        assert_eq!(target.id, "sha256:abc123");
+        assert_eq!(target.network, "app_default");
+        assert_eq!(target.ip, "172.22.0.4");
+    }
+
+    #[test]
+    fn parses_ipv6_only_container_address() {
+        let raw = RUNNING_INSPECT.replace("\"IPAddress\": \"172.22.0.4\"", "\"IPAddress\": \"\"");
+
+        let target = parse_inspected_container(&raw, "app-db-1", "app", "db", "app_default")
+            .expect("IPv6-only inspect result should parse");
+
+        assert_eq!(target.ip, "fd00::4");
+    }
+
+    #[test]
+    fn rejects_stopped_container() {
+        let raw = RUNNING_INSPECT.replace("\"Running\": true", "\"Running\": false");
+
+        let error = parse_inspected_container(&raw, "app-db-1", "app", "db", "app_default")
+            .expect_err("stopped container must fail");
+
+        assert!(error.to_string().contains("app-db-1 is not running"));
+    }
+
+    #[test]
+    fn rejects_mismatched_compose_labels() {
+        let raw = RUNNING_INSPECT.replace(
+            "\"com.docker.compose.project\": \"app\"",
+            "\"com.docker.compose.project\": \"billing\"",
+        );
+
+        let error = parse_inspected_container(&raw, "app-db-1", "app", "db", "app_default")
+            .expect_err("mismatched project label must fail");
+
+        assert!(error.to_string().contains("does not belong to app/db"));
+    }
+
+    #[test]
+    fn rejects_missing_network_and_empty_addresses() {
+        let missing =
+            parse_inspected_container(RUNNING_INSPECT, "app-db-1", "app", "db", "private")
+                .expect_err("missing network must fail");
+        assert!(missing.to_string().contains("private is not attached"));
+
+        let raw = RUNNING_INSPECT
+            .replace("\"IPAddress\": \"172.22.0.4\"", "\"IPAddress\": \"\"")
+            .replace(
+                "\"GlobalIPv6Address\": \"fd00::4\"",
+                "\"GlobalIPv6Address\": \"\"",
+            );
+        let empty = parse_inspected_container(&raw, "app-db-1", "app", "db", "app_default")
+            .expect_err("empty addresses must fail");
+        assert!(empty.to_string().contains("has no IP address"));
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_inspect_output() {
+        assert!(
+            parse_inspected_container("not-json", "app-db-1", "app", "db", "app_default").is_err()
+        );
+
+        let empty = parse_inspected_container("[]", "app-db-1", "app", "db", "app_default")
+            .expect_err("empty inspect output must fail");
+        assert!(empty.to_string().contains("exactly one container"));
+
+        let object = RUNNING_INSPECT
+            .trim()
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .expect("fixture should be an array");
+        let duplicate = format!("[{object},{object}]");
+        let multiple =
+            parse_inspected_container(&duplicate, "app-db-1", "app", "db", "app_default")
+                .expect_err("multiple inspect objects must fail");
+        assert!(multiple.to_string().contains("exactly one container"));
+    }
+
+    #[test]
+    fn rejects_missing_compose_labels() {
+        let raw = RUNNING_INSPECT.replace(
+            "\"com.docker.compose.service\": \"db\"",
+            "\"unrelated.label\": \"db\"",
+        );
+
+        let error = parse_inspected_container(&raw, "app-db-1", "app", "db", "app_default")
+            .expect_err("missing Compose label must fail");
+
+        assert!(error.to_string().contains("does not belong to app/db"));
     }
 }
