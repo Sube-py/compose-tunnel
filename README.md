@@ -113,6 +113,7 @@ cargo test --workspace
 cargo check --workspace
 pnpm test
 pnpm build
+git diff --check
 ```
 
 ## Notes
