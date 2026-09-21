@@ -19,7 +19,7 @@ import SelectButton from "primevue/selectbutton";
 import Tag from "primevue/tag";
 import Toast from "primevue/toast";
 import logoUrl from "../assets/logo.svg";
-import { mergeOperationLogs, parseOperationLogMessage, type OperationLogEntry } from "./operation-logs";
+import { decodeOutput, isCommandLogPersistenceError, mergeCommandLogs, parseCommandLogMessage, type CommandLogDetail, type CommandLogEntry } from "./command-logs";
 import {
   buildContainerOptions,
   findContainer,
@@ -113,10 +113,18 @@ const confirm = useConfirm();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
 const busyActions = ref<Record<string, boolean>>({});
-const logs = ref<OperationLogEntry[]>([]);
+const logs = ref<CommandLogEntry[]>([]);
 const logsLoading = ref(false);
 const logReadError = ref("");
 const logStreamError = ref("");
+const selectedCommandId = ref("");
+const commandDialogVisible = ref(false);
+const commandDetail = ref<CommandLogDetail | null>(null);
+const commandDetailLoading = ref(false);
+const commandDetailError = ref("");
+const selectedCommand = computed(() => logs.value.find((entry) => entry.id === selectedCommandId.value));
+const commandStdout = computed(() => commandDetail.value ? decodeOutput(commandDetail.value.stdout_base64) : "");
+const commandStderr = computed(() => commandDetail.value ? decodeOutput(commandDetail.value.stderr_base64) : "");
 let unlistenLogs: (() => void) | undefined;
 let logsMounted = false;
 const defaults = reactive<Defaults>({
@@ -275,16 +283,16 @@ const selectedTunnelService = computed(
 function setTab(tab: Tab) {
   activeTab.value = tab;
   if (tab === "Logs") {
-    void refreshOperationLogs();
+    void refreshCommandLogs();
   }
 }
 
-async function refreshOperationLogs() {
+async function refreshCommandLogs() {
   logsLoading.value = true;
   logReadError.value = "";
   try {
-    const history = await invoke<OperationLogEntry[]>("read_operation_logs", { limit: 200 });
-    logs.value = mergeOperationLogs(logs.value, history);
+    const history = await invoke<CommandLogEntry[]>("read_command_logs", { limit: 200 });
+    logs.value = mergeCommandLogs(logs.value, history);
   } catch (caught) {
     logReadError.value = caught instanceof Error ? caught.message : String(caught);
   } finally {
@@ -295,9 +303,11 @@ async function refreshOperationLogs() {
 async function initializeLogs() {
   try {
     const unlisten = await attachLogger(({ message }) => {
-      const entry = parseOperationLogMessage(message);
+      const entry = parseCommandLogMessage(message);
       if (entry) {
-        logs.value = mergeOperationLogs(logs.value, [entry]);
+        logs.value = mergeCommandLogs(logs.value, [entry]);
+      } else if (isCommandLogPersistenceError(message)) {
+        logStreamError.value = "A command log could not be saved. The SSH operation continued.";
       }
     });
     if (!logsMounted) {
@@ -308,7 +318,45 @@ async function initializeLogs() {
   } catch {
     logStreamError.value = "Live log updates unavailable. Refresh to load recent events.";
   }
-  await refreshOperationLogs();
+  await refreshCommandLogs();
+}
+
+async function refreshCommandDetail() {
+  const id = selectedCommandId.value;
+  if (!id) return;
+  commandDetailLoading.value = true;
+  commandDetailError.value = "";
+  try {
+    const detail = await invoke<CommandLogDetail>("read_command_detail", { id });
+    if (selectedCommandId.value === id) commandDetail.value = detail;
+  } catch (caught) {
+    if (selectedCommandId.value === id) commandDetailError.value = caught instanceof Error ? caught.message : String(caught);
+  } finally {
+    if (selectedCommandId.value === id) commandDetailLoading.value = false;
+  }
+}
+
+function openCommandDetail(entry: CommandLogEntry) {
+  selectedCommandId.value = entry.id;
+  commandDetail.value = null;
+  commandDialogVisible.value = true;
+  void refreshCommandDetail();
+}
+
+async function copyCommandText(value: string) {
+  try {
+    await navigator.clipboard.writeText(value);
+    toast.add({ severity: "success", summary: "Copied", life: 1800 });
+  } catch {
+    toast.add({ severity: "error", summary: "Copy failed", life: 3000 });
+  }
+}
+
+function commandSeverity(status: CommandLogEntry["status"]) {
+  if (status === "failure" || status === "timeout") return "danger";
+  if (status === "running") return "info";
+  if (status === "success") return "success";
+  return "secondary";
 }
 
 function isBusy(key: string) {
@@ -1347,10 +1395,10 @@ onUnmounted(() => {
         <header class="topbar">
           <div>
             <h2>{{ activeTab }}</h2>
-            <p v-if="activeTab === 'Logs'">{{ logs.length }} recent events</p>
+            <p v-if="activeTab === 'Logs'">{{ logs.length }} recent commands</p>
             <p v-else>{{ runningCount }} running tunnels, {{ stoppedCount }} stopped</p>
           </div>
-          <Button v-if="activeTab === 'Logs'" icon="pi pi-refresh" aria-label="Refresh logs" title="Refresh logs" :loading="logsLoading" @click="refreshOperationLogs" />
+          <Button v-if="activeTab === 'Logs'" icon="pi pi-refresh" aria-label="Refresh logs" title="Refresh logs" :loading="logsLoading" @click="refreshCommandLogs" />
           <Button v-else label="Refresh" icon="pi pi-refresh" :loading="isBusy('tunnels:refresh') || loading" @click="refreshTunnelsWithFeedback" />
         </header>
 
@@ -1780,21 +1828,52 @@ onUnmounted(() => {
       <section v-if="activeTab === 'Logs'" class="page">
         <p v-if="logStreamError" class="log-notice">{{ logStreamError }}</p>
         <p v-if="logReadError" class="log-notice log-error" role="alert">Could not load logs: {{ logReadError }}</p>
-        <DataTable :value="logs" dataKey="id" size="small" stripedRows class="logs-table" :loading="logsLoading">
+        <DataTable :value="logs" dataKey="id" size="small" stripedRows class="logs-table" :loading="logsLoading" selectionMode="single" @row-click="openCommandDetail($event.data)">
           <template #empty>
-            <div class="empty-state">{{ logsLoading ? 'Loading logs...' : 'No operations recorded yet.' }}</div>
+            <div class="empty-state">{{ logsLoading ? 'Loading commands...' : 'No SSH commands recorded yet.' }}</div>
           </template>
           <Column header="Time" class="log-time">
-            <template #body="{ data }">{{ new Date(data.timestamp).toLocaleString() }}</template>
+            <template #body="{ data }">{{ new Date(data.started_at).toLocaleString() }}</template>
           </Column>
-          <Column header="Level" class="log-level">
-            <template #body="{ data }"><Tag :value="data.level" :severity="data.level === 'error' ? 'danger' : 'secondary'" /></template>
+          <Column header="Server" class="log-server" field="server" />
+          <Column header="Command" class="log-command">
+            <template #body="{ data }"><span class="cell-ellipsis" :title="data.preview">{{ data.preview }}</span></template>
           </Column>
-          <Column field="operation" header="Operation" />
-          <Column field="target" header="Target" />
-          <Column field="outcome" header="Outcome" />
-          <Column field="detail" header="Detail" />
+          <Column header="Status" class="log-status">
+            <template #body="{ data }"><Tag :value="data.status" :severity="commandSeverity(data.status)" /></template>
+          </Column>
+          <Column header="Duration" class="log-duration">
+            <template #body="{ data }">{{ data.duration_ms === null ? '-' : `${data.duration_ms} ms` }}</template>
+          </Column>
         </DataTable>
+        <Dialog v-model:visible="commandDialogVisible" modal :header="selectedCommand?.preview || 'SSH command'" class="command-dialog" @hide="selectedCommandId = ''">
+          <div class="command-detail-toolbar">
+            <span>{{ selectedCommand?.server }} | {{ selectedCommand ? new Date(selectedCommand.started_at).toLocaleString() : '' }}</span>
+            <Tag v-if="selectedCommand" :value="selectedCommand.status" :severity="commandSeverity(selectedCommand.status)" />
+            <span v-if="selectedCommand?.exit_code !== null && selectedCommand?.exit_code !== undefined">Exit {{ selectedCommand.exit_code }}</span>
+            <Button icon="pi pi-refresh" aria-label="Refresh command detail" title="Refresh command detail" text :loading="commandDetailLoading" @click="refreshCommandDetail" />
+          </div>
+          <p v-if="commandDetailError" class="log-notice log-error" role="alert">Could not load command detail: {{ commandDetailError }}</p>
+          <div v-if="commandDetail" class="command-detail-content">
+            <div class="command-detail-section">
+              <div class="command-detail-heading"><strong>Local SSH command</strong><Button icon="pi pi-copy" aria-label="Copy local command" title="Copy local command" text size="small" @click="copyCommandText(commandDetail.local_command)" /></div>
+              <pre>{{ commandDetail.local_command }}</pre>
+            </div>
+            <div v-if="commandDetail.remote_command" class="command-detail-section">
+              <div class="command-detail-heading"><strong>Remote command</strong><Button icon="pi pi-copy" aria-label="Copy remote command" title="Copy remote command" text size="small" @click="copyCommandText(commandDetail.remote_command!)" /></div>
+              <pre>{{ commandDetail.remote_command }}</pre>
+            </div>
+            <div class="command-detail-section">
+              <div class="command-detail-heading"><strong>stdout</strong><Button icon="pi pi-copy" aria-label="Copy stdout" title="Copy stdout" text size="small" @click="copyCommandText(commandStdout)" /></div>
+              <pre>{{ commandStdout || '(empty)' }}</pre>
+            </div>
+            <div class="command-detail-section">
+              <div class="command-detail-heading"><strong>stderr</strong><Button icon="pi pi-copy" aria-label="Copy stderr" title="Copy stderr" text size="small" @click="copyCommandText(commandStderr)" /></div>
+              <pre>{{ commandStderr || '(empty)' }}</pre>
+            </div>
+          </div>
+          <p v-else-if="commandDetailLoading" class="empty-state">Loading command detail...</p>
+        </Dialog>
       </section>
 
       <section v-if="activeTab === 'Settings'" class="page form settings">

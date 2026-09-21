@@ -9,13 +9,15 @@ use compose_tunnel_core::{
     list_compose_services as core_list_compose_services,
     list_env_profiles as core_list_env_profiles, list_servers as core_list_servers,
     list_ssh_config_hosts as core_list_ssh_config_hosts, list_tunnels as core_list_tunnels,
-    load_config, open_tunnel as core_open_tunnel, read_operation_logs as core_read_operation_logs,
+    load_config, open_tunnel as core_open_tunnel, read_command_detail as core_read_command_detail,
+    read_command_logs as core_read_command_logs, read_operation_logs as core_read_operation_logs,
     render_env_profile as core_render_env_profile, save_defaults as core_save_defaults,
     save_env_profile as core_save_env_profile, save_server as core_save_server,
     set_active_env_profile as core_set_active_env_profile, test_server as core_test_server,
-    write_env_profile as core_write_env_profile, AppConfig, AppError, AppPaths, ComposeProject,
-    ComposeService, Defaults, EnvProfileConfig, OpenTunnelRequest, OperationLogEntry, ServerConfig,
-    ServerTestResult, SshConfigHost, TunnelState, WriteEnvProfileRequest,
+    write_env_profile as core_write_env_profile, AppConfig, AppError, AppPaths, CommandLogDetail,
+    CommandLogEntry, ComposeProject, ComposeService, Defaults, EnvProfileConfig, OpenTunnelRequest,
+    OperationLogEntry, ServerConfig, ServerTestResult, SshConfigHost, TunnelState,
+    WriteEnvProfileRequest,
 };
 
 type CommandResult<T> = std::result::Result<T, String>;
@@ -148,6 +150,22 @@ pub async fn read_operation_logs(limit: usize) -> CommandResult<Vec<OperationLog
     tauri::async_runtime::spawn_blocking(move || core_read_operation_logs(limit))
         .await
         .map_err(|_| "operation log reader failed".to_string())?
+        .map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn read_command_logs(limit: usize) -> CommandResult<Vec<CommandLogEntry>> {
+    tauri::async_runtime::spawn_blocking(move || core_read_command_logs(limit))
+        .await
+        .map_err(|_| "command log reader failed".to_string())?
+        .map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn read_command_detail(id: String) -> CommandResult<CommandLogDetail> {
+    tauri::async_runtime::spawn_blocking(move || core_read_command_detail(&id))
+        .await
+        .map_err(|_| "command detail reader failed".to_string())?
         .map_err(map_error)
 }
 

@@ -548,6 +548,7 @@ mod tests {
             local_host: "127.0.0.1".to_string(),
             local_port: 15432,
             ssh_pid: Some(1234),
+            command_log_id: None,
             status: TunnelStatus::Running,
             mode: TunnelMode::ContainerDirect,
             started_at: Some("2026-09-20T12:00:00Z".to_string()),

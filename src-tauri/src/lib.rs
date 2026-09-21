@@ -13,7 +13,7 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .target(
                     Target::new(TargetKind::Webview)
-                        .filter(|metadata| metadata.target() == "compose_tunnel::operation"),
+                        .filter(|metadata| metadata.target() == "compose_tunnel::command"),
                 )
                 .build(),
         )
@@ -41,6 +41,8 @@ pub fn run() {
             commands::close_all_tunnels,
             commands::list_tunnels,
             commands::read_operation_logs,
+            commands::read_command_logs,
+            commands::read_command_detail,
             commands::render_env_profile,
             commands::write_env_profile
         ])

@@ -17,7 +17,12 @@ use tokio::{
     time,
 };
 
+mod command_log;
+pub use command_log::{
+    read_command_detail, read_command_logs, CommandLogDetail, CommandLogEntry, CommandStatus,
+};
 mod operation_log;
+use command_log::{begin_command_in, command_output_files_in, finish_command_in};
 pub use operation_log::{read_operation_logs, OperationLevel, OperationLogEntry};
 use operation_log::{record_operation, record_operation_in};
 
@@ -217,6 +222,8 @@ pub struct TunnelState {
     pub local_port: u16,
     #[serde(default)]
     pub ssh_pid: Option<u32>,
+    #[serde(default)]
+    pub command_log_id: Option<String>,
     #[serde(default)]
     pub status: TunnelStatus,
     #[serde(default)]
@@ -1049,12 +1056,17 @@ async fn open_tunnel_inner(request: OpenTunnelRequest) -> Result<TunnelState> {
         request.target_port,
     );
 
+    let previous_command_id = state
+        .tunnels
+        .iter()
+        .find(|tunnel| tunnel.id == tunnel_id)
+        .and_then(|tunnel| tunnel.command_log_id.clone());
     if let Some(previous) = state.tunnels.iter().find(|tunnel| tunnel.id == tunnel_id) {
         release_previous_tunnel(previous).await?;
     }
 
     let local_port = resolve_local_port(&state, &tunnel_id, &local_host, request.local_port)?;
-    let child = spawn_ssh_forward(
+    let started = spawn_ssh_forward(
         &config.defaults,
         &server,
         &local_host,
@@ -1063,7 +1075,7 @@ async fn open_tunnel_inner(request: OpenTunnelRequest) -> Result<TunnelState> {
         request.target_port,
     )
     .await?;
-    let ssh_pid = child.id();
+    let ssh_pid = started.child.id();
 
     let tunnel = TunnelState {
         id: tunnel_id,
@@ -1078,6 +1090,7 @@ async fn open_tunnel_inner(request: OpenTunnelRequest) -> Result<TunnelState> {
         local_host,
         local_port,
         ssh_pid,
+        command_log_id: started.command_log_id.clone(),
         status: TunnelStatus::Running,
         mode: TunnelMode::ContainerDirect,
         started_at: Some(now_string()),
@@ -1089,9 +1102,29 @@ async fn open_tunnel_inner(request: OpenTunnelRequest) -> Result<TunnelState> {
         if let Some(pid) = ssh_pid {
             let _ = kill_pid(pid).await;
         }
+        finish_forward(
+            log_dir_for_state(&state_file).as_deref(),
+            started.command_log_id.as_deref(),
+            CommandStatus::Failure,
+        );
         return Err(error);
     }
+    finish_forward(
+        log_dir_for_state(&state_file).as_deref(),
+        previous_command_id.as_deref(),
+        CommandStatus::Stopped,
+    );
     Ok(tunnel)
+}
+
+fn log_dir_for_state(state_file: &Path) -> Option<PathBuf> {
+    state_file.parent().map(|parent| parent.join("logs"))
+}
+
+fn finish_forward(log_dir: Option<&Path>, id: Option<&str>, status: CommandStatus) {
+    if let (Some(dir), Some(id)) = (log_dir, id) {
+        command_log::finish_command_id_in(dir, id, status, None);
+    }
 }
 
 pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
@@ -1104,6 +1137,7 @@ async fn close_tunnel_at(state_file: &Path, tunnel_id: &str) -> Result<()> {
     let mut state = load_state_unlocked(state_file).await?;
     let mut found = false;
     let mut target = None;
+    let mut finished_id = None;
 
     for tunnel in &mut state.tunnels {
         if tunnel.id != tunnel_id {
@@ -1135,6 +1169,7 @@ async fn close_tunnel_at(state_file: &Path, tunnel_id: &str) -> Result<()> {
         }
         tunnel.status = TunnelStatus::Stopped;
         tunnel.ssh_pid = None;
+        finished_id = tunnel.command_log_id.clone();
     }
 
     if !found {
@@ -1152,6 +1187,11 @@ async fn close_tunnel_at(state_file: &Path, tunnel_id: &str) -> Result<()> {
         );
         return Err(error);
     }
+    finish_forward(
+        log_dir.as_deref(),
+        finished_id.as_deref(),
+        CommandStatus::Stopped,
+    );
     record_command_event(
         log_dir.as_deref(),
         OperationLevel::Info,
@@ -1174,6 +1214,7 @@ async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
     let mut changed = false;
     let mut stopped_targets = Vec::new();
     let mut failed_targets = Vec::new();
+    let mut finished_ids = Vec::new();
 
     for tunnel in &mut state.tunnels {
         let needs_stop = tunnel.status != TunnelStatus::Stopped || tunnel.ssh_pid.is_some();
@@ -1208,6 +1249,9 @@ async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
         changed |= needs_stop;
         tunnel.status = TunnelStatus::Stopped;
         tunnel.ssh_pid = None;
+        if needs_stop {
+            finished_ids.push(tunnel.command_log_id.clone());
+        }
     }
 
     if changed {
@@ -1231,6 +1275,9 @@ async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
                 "success",
                 Some("local forward stopped"),
             );
+        }
+        for id in &finished_ids {
+            finish_forward(log_dir.as_deref(), id.as_deref(), CommandStatus::Stopped);
         }
     }
     record_command_event(
@@ -1562,14 +1609,42 @@ async fn run_ssh_at(
     );
     let mut args = ssh_base_args(server);
     args.push(remote_command.to_string());
-    let output = match run_command_with_timeout(
-        &defaults.ssh_binary,
-        &args,
-        Duration::from_secs(defaults.docker_timeout_secs),
-        "ssh",
-    )
-    .await
-    {
+    let journal = log_dir.and_then(|dir| {
+        match begin_command_in(
+            dir,
+            &server.name,
+            remote_command,
+            &defaults.ssh_binary,
+            &args,
+            Some(remote_command),
+        ) {
+            Ok(entry) => Some((dir, entry)),
+            Err(_) => {
+                command_log::emit_persistence_error();
+                None
+            }
+        }
+    });
+    let timeout = Duration::from_secs(defaults.docker_timeout_secs);
+    let output = match &journal {
+        Some((dir, entry)) => match command_output_files_in(dir, &entry.id) {
+            Ok((stdout, stderr)) => {
+                run_ssh_to_files(
+                    &defaults.ssh_binary,
+                    &args,
+                    timeout,
+                    stdout,
+                    stderr,
+                    dir,
+                    &entry.id,
+                )
+                .await
+            }
+            Err(_) => run_command_with_timeout(&defaults.ssh_binary, &args, timeout, "ssh").await,
+        },
+        None => run_command_with_timeout(&defaults.ssh_binary, &args, timeout, "ssh").await,
+    };
+    let output = match output {
         Ok(output) => output,
         Err(error) => {
             let detail = if matches!(&error, AppError::Message(message) if message.starts_with("ssh timed out after"))
@@ -1578,6 +1653,16 @@ async fn run_ssh_at(
             } else {
                 "SSH command could not start or complete"
             };
+            if let Some((dir, entry)) = &journal {
+                let status = if detail == "timed out" {
+                    CommandStatus::Timeout
+                } else {
+                    CommandStatus::Failure
+                };
+                if finish_command_in(dir, entry, status, None).is_err() {
+                    command_log::emit_persistence_error();
+                }
+            }
             record_command_event(
                 log_dir,
                 OperationLevel::Error,
@@ -1589,6 +1674,16 @@ async fn run_ssh_at(
             return Err(error);
         }
     };
+    if let Some((dir, entry)) = &journal {
+        let status = if output.status.success() {
+            CommandStatus::Success
+        } else {
+            CommandStatus::Failure
+        };
+        if finish_command_in(dir, entry, status, output.status.code()).is_err() {
+            command_log::emit_persistence_error();
+        }
+    }
     if !output.status.success() {
         let detail = match output.status.code() {
             Some(code) => format!("exit code {code}"),
@@ -1619,6 +1714,41 @@ async fn run_ssh_at(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+async fn run_ssh_to_files(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    log_dir: &Path,
+    id: &str,
+) -> Result<Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .kill_on_drop(true)
+        .spawn()?;
+    let status = match time::timeout(timeout, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(AppError::msg(format!(
+                "ssh timed out after {} seconds",
+                timeout.as_secs_f64()
+            )));
+        }
+    };
+    let dir = log_dir.join("commands").join(id);
+    Ok(Output {
+        status,
+        stdout: std::fs::read(dir.join("stdout.bin"))?,
+        stderr: std::fs::read(dir.join("stderr.bin"))?,
+    })
+}
+
 async fn spawn_ssh_forward(
     defaults: &Defaults,
     server: &ServerConfig,
@@ -1626,7 +1756,7 @@ async fn spawn_ssh_forward(
     local_port: u16,
     remote_host: &str,
     remote_port: u16,
-) -> Result<Child> {
+) -> Result<ForwardStart> {
     let log_dir = app_paths().ok().map(|paths| paths.logs_dir);
     spawn_ssh_forward_at(
         defaults,
@@ -1648,7 +1778,7 @@ async fn spawn_ssh_forward_at(
     remote_host: &str,
     remote_port: u16,
     log_dir: Option<&Path>,
-) -> Result<Child> {
+) -> Result<ForwardStart> {
     let target = format!(
         "{} {local_host}:{local_port} -> {remote_host}:{remote_port}",
         server.name
@@ -1676,15 +1806,54 @@ async fn spawn_ssh_forward_at(
         }
     };
 
+    let journal = log_dir.and_then(|dir| {
+        match begin_command_in(
+            dir,
+            &server.name,
+            &format!(
+                "ssh -N -L {}",
+                ssh_forward_spec(local_host, local_port, remote_host, remote_port)
+            ),
+            &defaults.ssh_binary,
+            &args,
+            None,
+        ) {
+            Ok(entry) => Some((dir, entry)),
+            Err(_) => {
+                command_log::emit_persistence_error();
+                None
+            }
+        }
+    });
+    let output_files =
+        journal.as_ref().and_then(
+            |(dir, entry)| match command_output_files_in(dir, &entry.id) {
+                Ok(files) => Some(files),
+                Err(error) => {
+                    eprintln!("compose-tunnel: forward output files unavailable: {error}");
+                    command_log::emit_persistence_error();
+                    None
+                }
+            },
+        );
+    let (stdout, stderr) = match output_files {
+        Some((stdout, stderr)) => (Stdio::from(stdout), Stdio::from(stderr)),
+        None => (Stdio::null(), Stdio::null()),
+    };
     let mut child = match Command::new(&defaults.ssh_binary)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
     {
         Ok(child) => child,
         Err(error) => {
+            if let Some((dir, entry)) = &journal {
+                if finish_command_in(dir, entry, CommandStatus::Failure, None).is_err() {
+                    command_log::emit_persistence_error();
+                }
+            }
             record_command_event(
                 log_dir,
                 OperationLevel::Error,
@@ -1700,6 +1869,11 @@ async fn spawn_ssh_forward_at(
     time::sleep(Duration::from_millis(250)).await;
     match child.try_wait() {
         Ok(Some(status)) => {
+            if let Some((dir, entry)) = &journal {
+                if finish_command_in(dir, entry, CommandStatus::Failure, status.code()).is_err() {
+                    command_log::emit_persistence_error();
+                }
+            }
             let detail = match status.code() {
                 Some(code) => format!("exit code {code}"),
                 None => "SSH process terminated by signal".to_string(),
@@ -1726,13 +1900,21 @@ async fn spawn_ssh_forward_at(
                 "success",
                 detail.as_deref(),
             );
-            Ok(child)
+            Ok(ForwardStart {
+                child,
+                command_log_id: journal.map(|(_, entry)| entry.id),
+            })
         }
         Err(error) => {
             // The child state is unknown, so it may still be forwarding: kill
             // and reap it instead of dropping a live SSH process.
             let _ = child.kill().await;
             let _ = child.wait().await;
+            if let Some((dir, entry)) = &journal {
+                if finish_command_in(dir, entry, CommandStatus::Failure, None).is_err() {
+                    command_log::emit_persistence_error();
+                }
+            }
             record_command_event(
                 log_dir,
                 OperationLevel::Error,
@@ -1745,6 +1927,25 @@ async fn spawn_ssh_forward_at(
                 "ssh forward could not be checked during startup: {error}"
             )))
         }
+    }
+}
+
+#[derive(Debug)]
+struct ForwardStart {
+    child: Child,
+    command_log_id: Option<String>,
+}
+
+impl std::ops::Deref for ForwardStart {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ForwardStart {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
     }
 }
 
@@ -1967,7 +2168,7 @@ async fn release_previous_tunnel(previous: &TunnelState) -> Result<()> {
     let Some(pid) = previous.ssh_pid else {
         return Ok(());
     };
-    let _ = kill_pid(pid).await;
+    kill_pid(pid).await?;
     wait_for_local_port_release(&previous.local_host, previous.local_port).await
 }
 
@@ -2315,6 +2516,8 @@ enum ReconcileDecision {
 struct ReconcileReport {
     changed: bool,
     spawned_pids: Vec<u32>,
+    spawned_ids: Vec<String>,
+    finished_ids: Vec<String>,
     events: Vec<ReconcileEvent>,
 }
 
@@ -2358,12 +2561,15 @@ async fn terminate_and_mark_reconciliation_error(
     tunnel: &mut TunnelState,
     error: impl Into<String>,
 ) -> bool {
+    let mut failed_pid = None;
     if let Some(pid) = tunnel.ssh_pid {
-        if pid_is_running(pid) {
-            let _ = kill_pid(pid).await;
+        if kill_pid(pid).await.is_err() {
+            failed_pid = Some(pid);
         }
     }
-    mark_reconciliation_error(tunnel, error)
+    let changed = mark_reconciliation_error(tunnel, error);
+    tunnel.ssh_pid = failed_pid;
+    changed
 }
 
 async fn load_refreshed_state() -> Result<AppState> {
@@ -2385,6 +2591,9 @@ async fn refresh_state_at(config_file: &Path, state_file: &Path) -> Result<AppSt
     if report.changed {
         let saved = save_state_unlocked(state_file, &state).await;
         if let Err(error) = finalize_refresh_save(saved, &report.spawned_pids).await {
+            for id in &report.spawned_ids {
+                finish_forward(log_dir.as_deref(), Some(id), CommandStatus::Failure);
+            }
             record_command_event(
                 log_dir.as_deref(),
                 OperationLevel::Error,
@@ -2394,6 +2603,9 @@ async fn refresh_state_at(config_file: &Path, state_file: &Path) -> Result<AppSt
                 Some("state could not be saved; new SSH forwards stopped"),
             );
             return Err(error);
+        }
+        for id in &report.finished_ids {
+            finish_forward(log_dir.as_deref(), Some(id), CommandStatus::Stopped);
         }
         for event in report.events {
             record_command_event(
@@ -2426,6 +2638,8 @@ async fn reconcile_tunnels(
 ) -> ReconcileReport {
     let mut changed = false;
     let mut spawned_pids = Vec::new();
+    let mut spawned_ids = Vec::new();
+    let mut finished_ids = Vec::new();
     let mut events = Vec::new();
 
     for tunnel in &mut state.tunnels {
@@ -2450,6 +2664,11 @@ async fn reconcile_tunnels(
                 format!("server {} was not found", tunnel.server),
             )
             .await;
+            if let Some(id) = &tunnel.command_log_id {
+                if tunnel.ssh_pid.is_none() {
+                    finished_ids.push(id.clone());
+                }
+            }
             continue;
         };
 
@@ -2473,6 +2692,11 @@ async fn reconcile_tunnels(
                     detail: "container inspect failed".to_string(),
                 });
                 changed |= terminate_and_mark_reconciliation_error(tunnel, error.to_string()).await;
+                if let Some(id) = &tunnel.command_log_id {
+                    if tunnel.ssh_pid.is_none() {
+                        finished_ids.push(id.clone());
+                    }
+                }
                 continue;
             }
         };
@@ -2493,8 +2717,13 @@ async fn reconcile_tunnels(
                         outcome: "failure",
                         detail: "previous local forward could not be released".to_string(),
                     });
+                    let pid = tunnel.ssh_pid;
                     changed |= mark_reconciliation_error(tunnel, error.to_string());
+                    tunnel.ssh_pid = pid;
                     continue;
+                }
+                if let Some(id) = &tunnel.command_log_id {
+                    finished_ids.push(id.clone());
                 }
                 tunnel.ssh_pid = None;
 
@@ -2509,8 +2738,8 @@ async fn reconcile_tunnels(
                 )
                 .await
                 {
-                    Ok(child) => {
-                        let ssh_pid = child.id();
+                    Ok(started) => {
+                        let ssh_pid = started.child.id();
                         events.push(ReconcileEvent {
                             level: OperationLevel::Info,
                             target: tunnel_log_target(tunnel),
@@ -2529,9 +2758,13 @@ async fn reconcile_tunnels(
                         if let Some(pid) = ssh_pid {
                             spawned_pids.push(pid);
                         }
+                        if let Some(id) = &started.command_log_id {
+                            spawned_ids.push(id.clone());
+                        }
                         tunnel.container_id = inspected.id;
                         tunnel.container_ip = inspected.ip;
                         tunnel.ssh_pid = ssh_pid;
+                        tunnel.command_log_id = started.command_log_id;
                         tunnel.status = TunnelStatus::Running;
                         tunnel.started_at = Some(now_string());
                         tunnel.last_error = None;
@@ -2554,6 +2787,8 @@ async fn reconcile_tunnels(
     ReconcileReport {
         changed,
         spawned_pids,
+        spawned_ids,
+        finished_ids,
         events,
     }
 }
@@ -2679,6 +2914,7 @@ mod tests {
             local_host: "127.0.0.1".to_string(),
             local_port: 15432,
             ssh_pid: Some(1234),
+            command_log_id: None,
             status,
             mode: TunnelMode::ContainerDirect,
             started_at: Some("2026-09-20T12:00:00Z".to_string()),
@@ -3183,6 +3419,110 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn remote_command_capture_preserves_argv_and_raw_bytes() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let app = TempApp::new("command-capture");
+        let script = write_remote_log_test_ssh(
+            &app,
+            "fake ssh",
+            "printf 'stdout\\377'; printf 'stderr\\376' >&2",
+        );
+        let config = staging_config(&script.to_string_lossy());
+        let log_dir = app.dir.join("logs");
+        run_ssh_at(
+            &config.defaults,
+            &config.servers[0],
+            "docker ps --format '{{.Names}}'",
+            "Docker project discovery",
+            "staging",
+            Some(&log_dir),
+        )
+        .await
+        .unwrap();
+        let rows = command_log::read_command_logs_at(&log_dir, 200).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, CommandStatus::Success);
+        assert_eq!(rows[0].exit_code, Some(0));
+        let detail = command_log::read_command_detail_at(&log_dir, &rows[0].id).unwrap();
+        assert_eq!(
+            detail.args.last().unwrap(),
+            "docker ps --format '{{.Names}}'"
+        );
+        assert_eq!(
+            detail.remote_command.as_deref(),
+            Some("docker ps --format '{{.Names}}'")
+        );
+        assert!(detail.local_command.contains("docker ps --format"));
+        assert_eq!(
+            STANDARD.decode(detail.stdout_base64).unwrap(),
+            b"stdout\xff"
+        );
+        assert_eq!(
+            STANDARD.decode(detail.stderr_base64).unwrap(),
+            b"stderr\xfe"
+        );
+        assert!(!serde_json::to_string(&rows).unwrap().contains("stdout"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_command_capture_failure_timeout_and_spawn_failure() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let app = TempApp::new("command-failures");
+        let log_dir = app.dir.join("logs");
+        let script = write_remote_log_test_ssh(&app, "fake-ssh", "printf fail >&2; exit 7");
+        let mut config = staging_config(&script.to_string_lossy());
+        assert!(run_ssh_at(
+            &config.defaults,
+            &config.servers[0],
+            "docker ps",
+            "Discovery",
+            "staging",
+            Some(&log_dir)
+        )
+        .await
+        .is_err());
+        let failure = &command_log::read_command_logs_at(&log_dir, 200).unwrap()[0];
+        assert_eq!(failure.status, CommandStatus::Failure);
+        assert_eq!(failure.exit_code, Some(7));
+        let script =
+            write_remote_log_test_ssh(&app, "slow-ssh", "printf partial; printf err >&2; sleep 3");
+        config.defaults.ssh_binary = script.to_string_lossy().into_owned();
+        config.defaults.docker_timeout_secs = 1;
+        assert!(run_ssh_at(
+            &config.defaults,
+            &config.servers[0],
+            "docker inspect x",
+            "Inspect",
+            "staging",
+            Some(&log_dir)
+        )
+        .await
+        .is_err());
+        let timeout = &command_log::read_command_logs_at(&log_dir, 200).unwrap()[0];
+        assert_eq!(timeout.status, CommandStatus::Timeout);
+        let detail = command_log::read_command_detail_at(&log_dir, &timeout.id).unwrap();
+        assert_eq!(STANDARD.decode(detail.stdout_base64).unwrap(), b"partial");
+        assert_eq!(STANDARD.decode(detail.stderr_base64).unwrap(), b"err");
+        config.defaults.ssh_binary = app.dir.join("missing-ssh").to_string_lossy().into_owned();
+        assert!(run_ssh_at(
+            &config.defaults,
+            &config.servers[0],
+            "docker ps",
+            "Discovery",
+            "staging",
+            Some(&log_dir)
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            command_log::read_command_logs_at(&log_dir, 200).unwrap()[0].status,
+            CommandStatus::Failure
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn remote_command_logs_failure_without_remote_output() {
         let app = TempApp::new("remote-log-failure");
         let script = write_remote_log_test_ssh(
@@ -3548,6 +3888,127 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn forward_command_log_keeps_one_id_through_stop() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let app = TempApp::new("forward-command-lifecycle");
+        let ssh = write_remote_log_test_ssh(
+            &app,
+            "forward-ssh",
+            "printf forward-stderr >&2; exec sleep 30",
+        );
+        let config = staging_config(&ssh.to_string_lossy());
+        let log_dir = app.dir.join("logs");
+        let started = spawn_ssh_forward_at(
+            &config.defaults,
+            &config.servers[0],
+            "127.0.0.1",
+            15432,
+            "172.22.0.4",
+            5432,
+            Some(&log_dir),
+        )
+        .await
+        .unwrap();
+        let id = started.command_log_id.clone().expect("forward command ID");
+        let mut tunnel = direct_tunnel(TunnelStatus::Running);
+        tunnel.ssh_pid = started.child.id();
+        tunnel.command_log_id = Some(id.clone());
+        app.write_state(&AppState {
+            tunnels: vec![tunnel],
+        });
+        let rows = command_log::read_command_logs_at(&log_dir, 200).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, CommandStatus::Running);
+        let stderr_path = log_dir.join("commands").join(&id).join("stderr.bin");
+        for _ in 0..100 {
+            if std::fs::metadata(&stderr_path).is_ok_and(|metadata| metadata.len() > 0) {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        let detail = command_log::read_command_detail_at(&log_dir, &id).unwrap();
+        assert!(detail.local_command.contains("-N"));
+        assert!(detail.local_command.contains("-L"));
+        assert_eq!(
+            STANDARD.decode(detail.stderr_base64).unwrap(),
+            b"forward-stderr"
+        );
+        close_tunnel_at(&app.state_file, "db").await.unwrap();
+        let rows = command_log::read_command_logs_at(&log_dir, 200).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].status, CommandStatus::Stopped);
+        assert!(rows[0].revision >= 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_command_log_reconnect_finishes_old_and_starts_new() {
+        let app = TempApp::new("forward-command-reconnect");
+        let body = format!(
+            "case \"$*\" in *-N*) exec sleep 30 ;; *) printf '%s\\n' '{}' ;; esac",
+            REFRESHED_INSPECT
+        );
+        let ssh = write_remote_log_test_ssh(&app, "forward-ssh", &body);
+        let config = staging_config(&ssh.to_string_lossy());
+        std::fs::write(&app.config_file, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let log_dir = app.dir.join("logs");
+        let old = spawn_ssh_forward_at(
+            &config.defaults,
+            &config.servers[0],
+            "127.0.0.1",
+            15432,
+            "172.22.0.4",
+            5432,
+            Some(&log_dir),
+        )
+        .await
+        .unwrap();
+        let old_id = old.command_log_id.clone().unwrap();
+        let mut tunnel = direct_tunnel(TunnelStatus::Running);
+        tunnel.ssh_pid = old.child.id();
+        tunnel.command_log_id = Some(old_id.clone());
+        app.write_state(&AppState {
+            tunnels: vec![tunnel],
+        });
+        let refreshed = refresh_state_at(&app.config_file, &app.state_file)
+            .await
+            .unwrap();
+        let new_id = refreshed.tunnels[0].command_log_id.clone().unwrap();
+        assert_ne!(new_id, old_id);
+        let rows = command_log::read_command_logs_at(&log_dir, 200).unwrap();
+        assert_eq!(
+            rows.iter().find(|row| row.id == old_id).unwrap().status,
+            CommandStatus::Stopped
+        );
+        assert_eq!(
+            rows.iter().find(|row| row.id == new_id).unwrap().status,
+            CommandStatus::Running
+        );
+        close_tunnel_at(&app.state_file, "db").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_command_log_does_not_claim_stop_when_kill_fails() {
+        let app = TempApp::new("forward-command-stop-failure");
+        let log_dir = app.dir.join("logs");
+        let row = begin_command_in(&log_dir, "staging", "ssh -N -L", "ssh", &[], None).unwrap();
+        let mut tunnel = direct_tunnel(TunnelStatus::Running);
+        tunnel.ssh_pid = Some(u32::MAX);
+        tunnel.command_log_id = Some(row.id.clone());
+        app.write_state(&AppState {
+            tunnels: vec![tunnel],
+        });
+        assert!(close_tunnel_at(&app.state_file, "db").await.is_err());
+        assert_eq!(
+            command_log::read_command_logs_at(&log_dir, 200).unwrap()[0].status,
+            CommandStatus::Running
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn forward_logs_startup_failure() {
         let app = TempApp::new("forward-log-failure");
         let ssh = write_remote_log_test_ssh(&app, "forward-ssh", "exit 9");
@@ -3644,6 +4105,24 @@ mod tests {
         release_previous_tunnel(&previous)
             .await
             .expect("a previous tunnel without a pid must not wait for its old port");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn previous_forward_termination_failure_is_not_ignored() {
+        let mut previous = direct_tunnel(TunnelStatus::Running);
+        previous.ssh_pid = Some(u32::MAX);
+        assert!(release_previous_tunnel(&previous).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconciliation_preserves_pid_when_termination_fails() {
+        let mut tunnel = direct_tunnel(TunnelStatus::Running);
+        tunnel.ssh_pid = Some(u32::MAX);
+        terminate_and_mark_reconciliation_error(&mut tunnel, "inspect failed").await;
+        assert_eq!(tunnel.status, TunnelStatus::Error);
+        assert_eq!(tunnel.ssh_pid, Some(u32::MAX));
     }
 
     #[test]

@@ -431,24 +431,48 @@ nav {
 }
 
 .logs-table .p-datatable-tbody > tr > td {
-  max-width: 320px;
-  overflow-wrap: anywhere;
-  vertical-align: top;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 
 .logs-table .log-time {
-  width: 20%;
+  width: 190px;
   white-space: nowrap;
 }
 
-.logs-table .log-level {
-  width: 10%;
+.logs-table .log-server {
+  width: 125px;
 }
 
-.logs-table th:nth-child(3) { width: 16%; }
-.logs-table th:nth-child(4) { width: 29%; }
-.logs-table th:nth-child(5) { width: 10%; }
-.logs-table th:nth-child(6) { width: 15%; }
+.logs-table .log-status { width: 105px; }
+.logs-table .log-duration { width: 100px; }
+.logs-table .p-datatable-tbody > tr { cursor: pointer; height: 44px; }
+
+.command-dialog { width: min(920px, calc(100vw - 24px)); }
+.command-dialog .p-dialog-header { min-width: 0; }
+.command-dialog .p-dialog-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.command-dialog .p-dialog-content { max-height: min(740px, calc(100vh - 130px)); overflow-y: auto; }
+.command-detail-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-height: 42px; }
+.command-detail-toolbar > span:first-child { margin-right: auto; }
+.command-detail-content { display: grid; gap: 12px; }
+.command-detail-section { min-width: 0; }
+.command-detail-heading { display: flex; align-items: center; justify-content: space-between; min-height: 36px; }
+.command-detail-section pre {
+  margin: 0;
+  min-height: 44px;
+  padding: 12px;
+  border: 1px solid #d9e1de;
+  border-radius: 4px;
+  background: #f5f7f6;
+  color: #1d2a27;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow: auto;
+}
 
 .env-dialog {
   width: min(960px, calc(100vw - 32px));

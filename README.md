@@ -77,11 +77,13 @@ pnpm install
 pnpm tauri dev
 ```
 
-## Operation Logs
+## Command Logs
 
-The CLI and desktop app append remote SSH/Docker operations and local forward lifecycle events to UTC daily `operations-YYYY-MM-DD.jsonl` files in the platform configuration directory's `logs` subdirectory. These files are not deleted automatically. The desktop Logs page shows the most recent 200 entries, receives new desktop events live, and has a Refresh control to load entries written by a separate CLI process.
+The desktop Logs page shows the newest 200 SSH command invocations, including Compose discovery (`docker ps`), inspect, connectivity checks, and local `ssh -N -L` forwards. Click a row to see the exact local command, remote command, exit status, and complete stdout/stderr. Live desktop status changes arrive through the Tauri log plugin; Refresh loads commands written by the CLI, and the open detail dialog has its own Refresh control for ongoing output. Earlier operation summaries are retained on disk but are not mixed into this command list.
 
-Entries contain operation names, server/container context, outcomes, and safe failure categories. Credentials, full remote commands, command output, SSH stderr, environment values, and tunnel traffic are not recorded. The Tauri log plugin delivers desktop events to the view; the shared JSONL journal is the only persistent copy.
+The CLI and desktop app append command metadata revisions to UTC daily `commands-YYYY-MM-DD.jsonl` in the platform configuration directory's `logs` subdirectory. Exact arguments are in `commands/<id>/meta.json`; raw unmodified bytes are in `commands/<id>/stdout.bin` and `stderr.bin`. The older `operations-YYYY-MM-DD.jsonl` journal remains. Files are never truncated or deleted automatically, so storage can grow indefinitely. On Unix, command files are owner read/write (`0600`) and directories owner-only (`0700`); on Windows, access follows the current-user profile ACL.
+
+These files may contain credentials, tokens, internal IPs, Docker inspect JSON, private paths, and SSH stderr. Anyone with access as the same OS user or to backups may read them. Only command metadata is sent through the live Webview log event; raw output is read on demand when a row is opened.
 
 ## Env Profiles
 
