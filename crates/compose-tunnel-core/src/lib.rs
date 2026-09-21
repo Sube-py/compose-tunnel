@@ -938,6 +938,71 @@ fn select_compose_container<'a>(
 }
 
 pub async fn open_tunnel(request: OpenTunnelRequest) -> Result<TunnelState> {
+    let log_dir = app_paths().ok().map(|paths| paths.logs_dir);
+    log_open_attempt(log_dir.as_deref(), &request);
+    let result = open_tunnel_inner(request.clone()).await;
+    log_open_result(log_dir.as_deref(), &request, &result);
+    result
+}
+
+fn open_log_target(request: &OpenTunnelRequest) -> String {
+    format!(
+        "{}/{}/{}/{}:{}",
+        request.server,
+        request.project,
+        request.service,
+        request.container.as_deref().unwrap_or("auto"),
+        request.target_port
+    )
+}
+
+fn log_open_attempt(log_dir: Option<&Path>, request: &OpenTunnelRequest) {
+    record_command_event(
+        log_dir,
+        OperationLevel::Info,
+        "Tunnel open",
+        &open_log_target(request),
+        "attempt",
+        None,
+    );
+}
+
+fn log_open_result(
+    log_dir: Option<&Path>,
+    request: &OpenTunnelRequest,
+    result: &Result<TunnelState>,
+) {
+    match result {
+        Ok(tunnel) => record_command_event(
+            log_dir,
+            OperationLevel::Info,
+            "Tunnel open",
+            &open_log_target(request),
+            "success",
+            Some(&format!(
+                "{}:{} -> {}:{} on {} (PID {})",
+                tunnel.local_host,
+                tunnel.local_port,
+                tunnel.container_ip,
+                tunnel.target_port,
+                tunnel.network,
+                tunnel
+                    .ssh_pid
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+            )),
+        ),
+        Err(_) => record_command_event(
+            log_dir,
+            OperationLevel::Error,
+            "Tunnel open",
+            &open_log_target(request),
+            "failure",
+            Some("tunnel could not be opened"),
+        ),
+    }
+}
+
+async fn open_tunnel_inner(request: OpenTunnelRequest) -> Result<TunnelState> {
     validate_name("project", &request.project)?;
     validate_name("service", &request.service)?;
     if request.target_port == 0 {
@@ -1034,17 +1099,39 @@ pub async fn close_tunnel(tunnel_id: String) -> Result<()> {
 }
 
 async fn close_tunnel_at(state_file: &Path, tunnel_id: &str) -> Result<()> {
+    let log_dir = state_file.parent().map(|parent| parent.join("logs"));
     let _guard = lock_state().await;
     let mut state = load_state_unlocked(state_file).await?;
     let mut found = false;
+    let mut target = None;
 
     for tunnel in &mut state.tunnels {
         if tunnel.id != tunnel_id {
             continue;
         }
         found = true;
+        let tunnel_target = tunnel_log_target(tunnel);
+        record_command_event(
+            log_dir.as_deref(),
+            OperationLevel::Info,
+            "Tunnel stop",
+            &tunnel_target,
+            "attempt",
+            None,
+        );
+        target = Some(tunnel_target);
         if let Some(pid) = tunnel.ssh_pid {
-            kill_pid(pid).await?;
+            if let Err(error) = kill_pid(pid).await {
+                record_command_event(
+                    log_dir.as_deref(),
+                    OperationLevel::Error,
+                    "Tunnel stop",
+                    target.as_deref().unwrap_or(tunnel_id),
+                    "failure",
+                    Some("local SSH process could not be stopped"),
+                );
+                return Err(error);
+            }
         }
         tunnel.status = TunnelStatus::Stopped;
         tunnel.ssh_pid = None;
@@ -1054,7 +1141,26 @@ async fn close_tunnel_at(state_file: &Path, tunnel_id: &str) -> Result<()> {
         return Err(AppError::msg(format!("tunnel {tunnel_id} was not found")));
     }
 
-    save_state_unlocked(state_file, &state).await
+    if let Err(error) = save_state_unlocked(state_file, &state).await {
+        record_command_event(
+            log_dir.as_deref(),
+            OperationLevel::Error,
+            "Tunnel stop",
+            target.as_deref().unwrap_or(tunnel_id),
+            "failure",
+            Some("stopped state could not be saved"),
+        );
+        return Err(error);
+    }
+    record_command_event(
+        log_dir.as_deref(),
+        OperationLevel::Info,
+        "Tunnel stop",
+        target.as_deref().unwrap_or(tunnel_id),
+        "success",
+        Some("local forward stopped"),
+    );
+    Ok(())
 }
 
 pub async fn close_all_tunnels() -> Result<()> {
@@ -1062,11 +1168,16 @@ pub async fn close_all_tunnels() -> Result<()> {
 }
 
 async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
+    let log_dir = state_file.parent().map(|parent| parent.join("logs"));
     let _guard = lock_state().await;
     let mut state = load_state_unlocked(state_file).await?;
     let mut changed = false;
+    let mut stopped_targets = Vec::new();
 
     for tunnel in &mut state.tunnels {
+        if tunnel.status != TunnelStatus::Stopped || tunnel.ssh_pid.is_some() {
+            stopped_targets.push(tunnel_log_target(tunnel));
+        }
         if let Some(pid) = tunnel.ssh_pid {
             let _ = kill_pid(pid).await;
         }
@@ -1076,8 +1187,36 @@ async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
     }
 
     if changed {
-        save_state_unlocked(state_file, &state).await?;
+        if let Err(error) = save_state_unlocked(state_file, &state).await {
+            record_command_event(
+                log_dir.as_deref(),
+                OperationLevel::Error,
+                "Tunnel stop all",
+                "all tunnels",
+                "failure",
+                Some("stopped state could not be saved"),
+            );
+            return Err(error);
+        }
+        for target in &stopped_targets {
+            record_command_event(
+                log_dir.as_deref(),
+                OperationLevel::Info,
+                "Tunnel stop",
+                target,
+                "success",
+                Some("local forward stopped"),
+            );
+        }
     }
+    record_command_event(
+        log_dir.as_deref(),
+        OperationLevel::Info,
+        "Tunnel stop all",
+        "all tunnels",
+        "success",
+        Some(&format!("{} tunnel(s) stopped", stopped_targets.len())),
+    );
     Ok(())
 }
 
@@ -1446,26 +1585,120 @@ async fn spawn_ssh_forward(
     remote_host: &str,
     remote_port: u16,
 ) -> Result<Child> {
-    let args = ssh_forward_args(server, local_host, local_port, remote_host, remote_port)?;
+    let log_dir = app_paths().ok().map(|paths| paths.logs_dir);
+    spawn_ssh_forward_at(
+        defaults,
+        server,
+        local_host,
+        local_port,
+        remote_host,
+        remote_port,
+        log_dir.as_deref(),
+    )
+    .await
+}
 
-    let mut child = Command::new(&defaults.ssh_binary)
+async fn spawn_ssh_forward_at(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    local_host: &str,
+    local_port: u16,
+    remote_host: &str,
+    remote_port: u16,
+    log_dir: Option<&Path>,
+) -> Result<Child> {
+    let target = format!(
+        "{} {local_host}:{local_port} -> {remote_host}:{remote_port}",
+        server.name
+    );
+    record_command_event(
+        log_dir,
+        OperationLevel::Info,
+        "SSH forward",
+        &target,
+        "attempt",
+        None,
+    );
+    let args = match ssh_forward_args(server, local_host, local_port, remote_host, remote_port) {
+        Ok(args) => args,
+        Err(error) => {
+            record_command_event(
+                log_dir,
+                OperationLevel::Error,
+                "SSH forward",
+                &target,
+                "failure",
+                Some("invalid forward address or port"),
+            );
+            return Err(error);
+        }
+    };
+
+    let mut child = match Command::new(&defaults.ssh_binary)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            record_command_event(
+                log_dir,
+                OperationLevel::Error,
+                "SSH forward",
+                &target,
+                "failure",
+                Some("SSH process could not start"),
+            );
+            return Err(error.into());
+        }
+    };
 
     time::sleep(Duration::from_millis(250)).await;
     match child.try_wait() {
-        Ok(Some(status)) => Err(AppError::msg(format!(
-            "ssh forward exited during startup with status {status}"
-        ))),
-        Ok(None) => Ok(child),
+        Ok(Some(status)) => {
+            let detail = match status.code() {
+                Some(code) => format!("exit code {code}"),
+                None => "SSH process terminated by signal".to_string(),
+            };
+            record_command_event(
+                log_dir,
+                OperationLevel::Error,
+                "SSH forward",
+                &target,
+                "failure",
+                Some(&detail),
+            );
+            Err(AppError::msg(format!(
+                "ssh forward exited during startup with status {status}"
+            )))
+        }
+        Ok(None) => {
+            let detail = child.id().map(|pid| format!("PID {pid}"));
+            record_command_event(
+                log_dir,
+                OperationLevel::Info,
+                "SSH forward",
+                &target,
+                "success",
+                detail.as_deref(),
+            );
+            Ok(child)
+        }
         Err(error) => {
             // The child state is unknown, so it may still be forwarding: kill
             // and reap it instead of dropping a live SSH process.
             let _ = child.kill().await;
             let _ = child.wait().await;
+            record_command_event(
+                log_dir,
+                OperationLevel::Error,
+                "SSH forward",
+                &target,
+                "failure",
+                Some("SSH process could not be checked during startup"),
+            );
             Err(AppError::msg(format!(
                 "ssh forward could not be checked during startup: {error}"
             )))
@@ -1583,16 +1816,47 @@ async fn inspect_container(
     service: &str,
     network: &str,
 ) -> Result<InspectedContainer> {
+    let log_dir = app_paths().ok().map(|paths| paths.logs_dir);
+    inspect_container_at(
+        defaults,
+        server,
+        container,
+        project,
+        service,
+        network,
+        log_dir.as_deref(),
+    )
+    .await
+}
+
+async fn inspect_container_at(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    container: &str,
+    project: &str,
+    service: &str,
+    network: &str,
+    log_dir: Option<&Path>,
+) -> Result<InspectedContainer> {
     let command = format!(
         "{} inspect --type container {}",
         docker_command(server),
         shell_quote(container)
     );
     let target = format!("{}/{project}/{service}/{container}", server.name);
-    let output = run_ssh(defaults, server, &command, "Docker inspect", &target).await?;
+    let output = run_ssh_at(
+        defaults,
+        server,
+        &command,
+        "Docker inspect",
+        &target,
+        log_dir,
+    )
+    .await?;
     let inspected = parse_inspected_container(&output, container, project, service, network);
     if inspected.is_err() {
-        record_operation(
+        record_command_event(
+            log_dir,
             OperationLevel::Error,
             "Docker inspect validation",
             &target,
@@ -1983,6 +2247,13 @@ fn upsert_tunnel(state: &mut AppState, tunnel: TunnelState) {
     state.tunnels.sort_by(|left, right| left.id.cmp(&right.id));
 }
 
+fn tunnel_log_target(tunnel: &TunnelState) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        tunnel.server, tunnel.project, tunnel.service, tunnel.container
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ReconcileDecision {
     Skip,
@@ -1995,6 +2266,15 @@ enum ReconcileDecision {
 struct ReconcileReport {
     changed: bool,
     spawned_pids: Vec<u32>,
+    events: Vec<ReconcileEvent>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReconcileEvent {
+    level: OperationLevel,
+    target: String,
+    outcome: &'static str,
+    detail: String,
 }
 
 fn reconciliation_decision(
@@ -2049,12 +2329,33 @@ async fn load_refreshed_state() -> Result<AppState> {
 /// replaces.
 async fn refresh_state_at(config_file: &Path, state_file: &Path) -> Result<AppState> {
     let config = load_config_at(config_file).await?;
+    let log_dir = state_file.parent().map(|parent| parent.join("logs"));
     let _guard = lock_state().await;
     let mut state = load_state_unlocked(state_file).await?;
-    let report = reconcile_tunnels(&config, &mut state).await;
+    let report = reconcile_tunnels(&config, &mut state, log_dir.as_deref()).await;
     if report.changed {
         let saved = save_state_unlocked(state_file, &state).await;
-        finalize_refresh_save(saved, &report.spawned_pids).await?;
+        if let Err(error) = finalize_refresh_save(saved, &report.spawned_pids).await {
+            record_command_event(
+                log_dir.as_deref(),
+                OperationLevel::Error,
+                "Tunnel reconciliation",
+                "saved tunnels",
+                "failure",
+                Some("state could not be saved; new SSH forwards stopped"),
+            );
+            return Err(error);
+        }
+        for event in report.events {
+            record_command_event(
+                log_dir.as_deref(),
+                event.level,
+                "Tunnel reconnect",
+                &event.target,
+                event.outcome,
+                Some(&event.detail),
+            );
+        }
     }
     Ok(state)
 }
@@ -2069,9 +2370,14 @@ async fn finalize_refresh_save(save_result: Result<()>, spawned_pids: &[u32]) ->
     Err(error)
 }
 
-async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> ReconcileReport {
+async fn reconcile_tunnels(
+    config: &AppConfig,
+    state: &mut AppState,
+    log_dir: Option<&Path>,
+) -> ReconcileReport {
     let mut changed = false;
     let mut spawned_pids = Vec::new();
+    let mut events = Vec::new();
 
     for tunnel in &mut state.tunnels {
         if tunnel.status == TunnelStatus::Stopped {
@@ -2084,6 +2390,12 @@ async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> Reconcil
             .find(|server| server.name == tunnel.server)
             .cloned()
         else {
+            events.push(ReconcileEvent {
+                level: OperationLevel::Error,
+                target: tunnel_log_target(tunnel),
+                outcome: "failure",
+                detail: "server is no longer configured".to_string(),
+            });
             changed |= terminate_and_mark_reconciliation_error(
                 tunnel,
                 format!("server {} was not found", tunnel.server),
@@ -2092,18 +2404,25 @@ async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> Reconcil
             continue;
         };
 
-        let inspected = match inspect_container(
+        let inspected = match inspect_container_at(
             &config.defaults,
             &server,
             &tunnel.container,
             &tunnel.project,
             &tunnel.service,
             &tunnel.network,
+            log_dir,
         )
         .await
         {
             Ok(inspected) => inspected,
             Err(error) => {
+                events.push(ReconcileEvent {
+                    level: OperationLevel::Error,
+                    target: tunnel_log_target(tunnel),
+                    outcome: "failure",
+                    detail: "container inspect failed".to_string(),
+                });
                 changed |= terminate_and_mark_reconciliation_error(tunnel, error.to_string()).await;
                 continue;
             }
@@ -2119,23 +2438,45 @@ async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> Reconcil
             }
             ReconcileDecision::Restart => {
                 if let Err(error) = release_previous_tunnel(tunnel).await {
+                    events.push(ReconcileEvent {
+                        level: OperationLevel::Error,
+                        target: tunnel_log_target(tunnel),
+                        outcome: "failure",
+                        detail: "previous local forward could not be released".to_string(),
+                    });
                     changed |= mark_reconciliation_error(tunnel, error.to_string());
                     continue;
                 }
                 tunnel.ssh_pid = None;
 
-                match spawn_ssh_forward(
+                match spawn_ssh_forward_at(
                     &config.defaults,
                     &server,
                     &tunnel.local_host,
                     tunnel.local_port,
                     &inspected.ip,
                     tunnel.target_port,
+                    log_dir,
                 )
                 .await
                 {
                     Ok(child) => {
                         let ssh_pid = child.id();
+                        events.push(ReconcileEvent {
+                            level: OperationLevel::Info,
+                            target: tunnel_log_target(tunnel),
+                            outcome: "success",
+                            detail: format!(
+                                "{}:{} -> {}:{} on {} (PID {})",
+                                tunnel.local_host,
+                                tunnel.local_port,
+                                inspected.ip,
+                                tunnel.target_port,
+                                tunnel.network,
+                                ssh_pid
+                                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+                            ),
+                        });
                         if let Some(pid) = ssh_pid {
                             spawned_pids.push(pid);
                         }
@@ -2148,6 +2489,12 @@ async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> Reconcil
                         changed = true;
                     }
                     Err(error) => {
+                        events.push(ReconcileEvent {
+                            level: OperationLevel::Error,
+                            target: tunnel_log_target(tunnel),
+                            outcome: "failure",
+                            detail: "new local SSH forward could not start".to_string(),
+                        });
                         changed |= mark_reconciliation_error(tunnel, error.to_string());
                     }
                 }
@@ -2158,6 +2505,7 @@ async fn reconcile_tunnels(config: &AppConfig, state: &mut AppState) -> Reconcil
     ReconcileReport {
         changed,
         spawned_pids,
+        events,
     }
 }
 
@@ -2845,6 +3193,42 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn reconciliation_logs_restarted_target() {
+        let app = TempApp::new("reconciliation-log-restart");
+        let marker = app.dir.join("inspect.started");
+        let ssh = write_stalling_ssh(&app, &marker, REFRESHED_INSPECT);
+        std::fs::write(
+            &app.config_file,
+            toml::to_string_pretty(&staging_config(&ssh.to_string_lossy()))
+                .expect("config should serialize"),
+        )
+        .expect("config file should be written");
+        app.write_state(&AppState {
+            tunnels: vec![desired_running_tunnel()],
+        });
+
+        let refreshed = refresh_state_at(&app.config_file, &app.state_file)
+            .await
+            .expect("refresh should reconnect");
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("logged operations");
+        assert!(entries.iter().any(|entry| {
+            entry.operation == "Tunnel reconnect"
+                && entry.outcome == "success"
+                && entry.target.contains("staging/app/db/app-db-1")
+                && entry
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("172.22.0.8:5432"))
+        }));
+
+        close_tunnel_at(&app.state_file, &refreshed.tunnels[0].id)
+            .await
+            .expect("stop fake forward");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn refresh_transaction_does_not_overwrite_a_concurrent_close() {
         let app = TempApp::new("refresh-close-race");
         let marker = app.dir.join("inspect.started");
@@ -2932,6 +3316,71 @@ mod tests {
             .tunnels
             .iter()
             .all(|tunnel| tunnel.status == TunnelStatus::Stopped && tunnel.ssh_pid.is_none()));
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("stop-all journal");
+        assert!(entries.iter().any(|entry| {
+            entry.operation == "Tunnel stop"
+                && entry.outcome == "success"
+                && entry.target.contains("staging/app/db/app-db-1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn tunnel_stop_logs_after_state_is_saved() {
+        let app = TempApp::new("stop-log-success");
+        app.write_state(&AppState {
+            tunnels: vec![TunnelState {
+                ssh_pid: None,
+                ..direct_tunnel(TunnelStatus::Running)
+            }],
+        });
+
+        close_tunnel_at(&app.state_file, "db")
+            .await
+            .expect("tunnel stopped");
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("stop journal");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].outcome, "attempt");
+        assert_eq!(entries[1].operation, "Tunnel stop");
+        assert_eq!(entries[1].outcome, "success");
+        assert_eq!(app.read_state().tunnels[0].status, TunnelStatus::Stopped);
+    }
+
+    #[test]
+    fn tunnel_open_logs_result_without_raw_error_text() {
+        let app = TempApp::new("open-log-result");
+        let log_dir = app.dir.join("logs");
+        let request = OpenTunnelRequest {
+            server: "staging".to_string(),
+            project: "app".to_string(),
+            service: "db".to_string(),
+            container: Some("app-db-1".to_string()),
+            target_port: 5432,
+            network: Some("app_default".to_string()),
+            local_host: Some("127.0.0.1".to_string()),
+            local_port: Some(15432),
+        };
+        log_open_attempt(Some(&log_dir), &request);
+        let result = Ok(direct_tunnel(TunnelStatus::Running));
+        log_open_result(Some(&log_dir), &request, &result);
+        let failure: Result<TunnelState> = Err(AppError::msg("PRIVATE_OUTPUT_MARKER"));
+        log_open_result(Some(&log_dir), &request, &failure);
+
+        let entries = operation_log::read_operation_logs_at(&log_dir, 200).expect("open journal");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].outcome, "attempt");
+        assert_eq!(entries[1].outcome, "success");
+        assert_eq!(entries[1].target, "staging/app/db/app-db-1:5432");
+        assert!(entries[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("127.0.0.1:15432 -> 172.22.0.4:5432 on app_default"));
+        assert_eq!(entries[2].outcome, "failure");
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("PRIVATE_OUTPUT_MARKER"));
     }
 
     #[cfg(unix)]
@@ -2952,6 +3401,69 @@ mod tests {
             error.to_string().contains("exited during startup"),
             "unexpected startup error: {error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_logs_successful_local_binding_without_command_args() {
+        let app = TempApp::new("forward-log-success");
+        let ssh = write_remote_log_test_ssh(&app, "forward-ssh", "exec sleep 30");
+        let config = staging_config(&ssh.to_string_lossy());
+        let mut child = spawn_ssh_forward_at(
+            &config.defaults,
+            &config.servers[0],
+            "127.0.0.1",
+            15432,
+            "172.22.0.4",
+            5432,
+            Some(&app.dir.join("logs")),
+        )
+        .await
+        .expect("fake forward starts");
+        let pid = child.id().expect("fake forward PID");
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("forward events");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].outcome, "attempt");
+        assert_eq!(entries[1].operation, "SSH forward");
+        assert_eq!(entries[1].outcome, "success");
+        assert!(entries[1].target.contains("127.0.0.1:15432"));
+        assert!(entries[1].target.contains("172.22.0.4:5432"));
+        assert_eq!(
+            entries[1].detail.as_deref(),
+            Some(format!("PID {pid}").as_str())
+        );
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("forward-ssh"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_logs_startup_failure() {
+        let app = TempApp::new("forward-log-failure");
+        let ssh = write_remote_log_test_ssh(&app, "forward-ssh", "exit 9");
+        let config = staging_config(&ssh.to_string_lossy());
+        spawn_ssh_forward_at(
+            &config.defaults,
+            &config.servers[0],
+            "127.0.0.1",
+            15432,
+            "172.22.0.4",
+            5432,
+            Some(&app.dir.join("logs")),
+        )
+        .await
+        .expect_err("fake forward exits immediately");
+
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("forward events");
+        assert_eq!(entries[1].operation, "SSH forward");
+        assert_eq!(entries[1].outcome, "failure");
+        assert_eq!(entries[1].detail.as_deref(), Some("exit code 9"));
     }
 
     #[test]
