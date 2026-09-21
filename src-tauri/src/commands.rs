@@ -9,13 +9,13 @@ use compose_tunnel_core::{
     list_compose_services as core_list_compose_services,
     list_env_profiles as core_list_env_profiles, list_servers as core_list_servers,
     list_ssh_config_hosts as core_list_ssh_config_hosts, list_tunnels as core_list_tunnels,
-    load_config, open_tunnel as core_open_tunnel, render_env_profile as core_render_env_profile,
-    save_defaults as core_save_defaults, save_env_profile as core_save_env_profile,
-    save_server as core_save_server, set_active_env_profile as core_set_active_env_profile,
-    test_server as core_test_server, write_env_profile as core_write_env_profile, AppConfig,
-    AppError, AppPaths, ComposeProject, ComposeService, Defaults, EnvProfileConfig,
-    OpenTunnelRequest, ServerConfig, ServerTestResult, SshConfigHost, TunnelState,
-    WriteEnvProfileRequest,
+    load_config, open_tunnel as core_open_tunnel, read_operation_logs as core_read_operation_logs,
+    render_env_profile as core_render_env_profile, save_defaults as core_save_defaults,
+    save_env_profile as core_save_env_profile, save_server as core_save_server,
+    set_active_env_profile as core_set_active_env_profile, test_server as core_test_server,
+    write_env_profile as core_write_env_profile, AppConfig, AppError, AppPaths, ComposeProject,
+    ComposeService, Defaults, EnvProfileConfig, OpenTunnelRequest, OperationLogEntry, ServerConfig,
+    ServerTestResult, SshConfigHost, TunnelState, WriteEnvProfileRequest,
 };
 
 type CommandResult<T> = std::result::Result<T, String>;
@@ -141,6 +141,14 @@ pub async fn close_all_tunnels() -> CommandResult<()> {
 #[tauri::command]
 pub async fn list_tunnels() -> CommandResult<Vec<TunnelState>> {
     core_list_tunnels().await.map_err(map_error)
+}
+
+#[tauri::command]
+pub async fn read_operation_logs(limit: usize) -> CommandResult<Vec<OperationLogEntry>> {
+    tauri::async_runtime::spawn_blocking(move || core_read_operation_logs(limit))
+        .await
+        .map_err(|_| "operation log reader failed".to_string())?
+        .map_err(map_error)
 }
 
 #[tauri::command]

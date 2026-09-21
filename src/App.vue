@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { attachLogger } from "@tauri-apps/plugin-log";
 import { useConfirm } from "primevue/useconfirm";
 import { useToast } from "primevue/usetoast";
 import Button from "primevue/button";
@@ -18,6 +19,7 @@ import SelectButton from "primevue/selectbutton";
 import Tag from "primevue/tag";
 import Toast from "primevue/toast";
 import logoUrl from "../assets/logo.svg";
+import { mergeOperationLogs, parseOperationLogMessage, type OperationLogEntry } from "./operation-logs";
 import {
   buildContainerOptions,
   findContainer,
@@ -111,7 +113,12 @@ const confirm = useConfirm();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
 const busyActions = ref<Record<string, boolean>>({});
-const logs = ref<string[]>([]);
+const logs = ref<OperationLogEntry[]>([]);
+const logsLoading = ref(false);
+const logReadError = ref("");
+const logStreamError = ref("");
+let unlistenLogs: (() => void) | undefined;
+let logsMounted = false;
 const defaults = reactive<Defaults>({
   local_host: "127.0.0.1",
   ssh_binary: "ssh",
@@ -267,11 +274,41 @@ const selectedTunnelService = computed(
 
 function setTab(tab: Tab) {
   activeTab.value = tab;
+  if (tab === "Logs") {
+    void refreshOperationLogs();
+  }
 }
 
-function log(message: string) {
-  logs.value.unshift(`${new Date().toLocaleTimeString()} ${message}`);
-  logs.value = logs.value.slice(0, 80);
+async function refreshOperationLogs() {
+  logsLoading.value = true;
+  logReadError.value = "";
+  try {
+    const history = await invoke<OperationLogEntry[]>("read_operation_logs", { limit: 200 });
+    logs.value = mergeOperationLogs(logs.value, history);
+  } catch (caught) {
+    logReadError.value = caught instanceof Error ? caught.message : String(caught);
+  } finally {
+    logsLoading.value = false;
+  }
+}
+
+async function initializeLogs() {
+  try {
+    const unlisten = await attachLogger(({ message }) => {
+      const entry = parseOperationLogMessage(message);
+      if (entry) {
+        logs.value = mergeOperationLogs(logs.value, [entry]);
+      }
+    });
+    if (!logsMounted) {
+      unlisten();
+      return;
+    }
+    unlistenLogs = unlisten;
+  } catch {
+    logStreamError.value = "Live log updates unavailable. Refresh to load recent events.";
+  }
+  await refreshOperationLogs();
 }
 
 function isBusy(key: string) {
@@ -301,14 +338,12 @@ async function runTask<T>(
   setBusy(busyKey, true);
   try {
     const result = await task();
-    log(message);
     if (showSuccessToast) {
       toast.add({ severity: "success", summary: message, life: 2600 });
     }
     return result;
   } catch (caught) {
     const text = caught instanceof Error ? caught.message : String(caught);
-    log(`Error: ${text}`);
     toast.add({ severity: "error", summary: "Operation failed", detail: text, life: 5000 });
     return null;
   } finally {
@@ -460,7 +495,6 @@ async function testServer(name: string) {
     `server:test:${name}`,
   );
   if (result) {
-    logs.value.unshift(...result.details.map((detail) => `${new Date().toLocaleTimeString()} ${detail}`));
     const ok = result.details.length > 0 && !result.details.some((detail) => detail.toLowerCase().includes("failed"));
     toast.add({
       severity: ok ? "success" : "error",
@@ -1273,7 +1307,14 @@ function onDockerModeChange(value: string) {
   applyDockerCommandPreset(value);
 }
 
-onMounted(bootstrap);
+onMounted(() => {
+  logsMounted = true;
+  void initializeLogs().then(bootstrap);
+});
+onUnmounted(() => {
+  logsMounted = false;
+  unlistenLogs?.();
+});
 </script>
 
 <template>
@@ -1306,9 +1347,11 @@ onMounted(bootstrap);
         <header class="topbar">
           <div>
             <h2>{{ activeTab }}</h2>
-            <p>{{ runningCount }} running tunnels, {{ stoppedCount }} stopped</p>
+            <p v-if="activeTab === 'Logs'">{{ logs.length }} recent events</p>
+            <p v-else>{{ runningCount }} running tunnels, {{ stoppedCount }} stopped</p>
           </div>
-          <Button label="Refresh" icon="pi pi-refresh" :loading="isBusy('tunnels:refresh') || loading" @click="refreshTunnelsWithFeedback" />
+          <Button v-if="activeTab === 'Logs'" icon="pi pi-refresh" aria-label="Refresh logs" title="Refresh logs" :loading="logsLoading" @click="refreshOperationLogs" />
+          <Button v-else label="Refresh" icon="pi pi-refresh" :loading="isBusy('tunnels:refresh') || loading" @click="refreshTunnelsWithFeedback" />
         </header>
 
       <section v-if="activeTab === 'Dashboard'" class="page">
@@ -1735,7 +1778,23 @@ onMounted(bootstrap);
       </section>
 
       <section v-if="activeTab === 'Logs'" class="page">
-        <pre>{{ logs.join('\n') }}</pre>
+        <p v-if="logStreamError" class="log-notice">{{ logStreamError }}</p>
+        <p v-if="logReadError" class="log-notice log-error" role="alert">Could not load logs: {{ logReadError }}</p>
+        <DataTable :value="logs" dataKey="id" size="small" stripedRows class="logs-table" :loading="logsLoading">
+          <template #empty>
+            <div class="empty-state">{{ logsLoading ? 'Loading logs...' : 'No operations recorded yet.' }}</div>
+          </template>
+          <Column header="Time" class="log-time">
+            <template #body="{ data }">{{ new Date(data.timestamp).toLocaleString() }}</template>
+          </Column>
+          <Column header="Level" class="log-level">
+            <template #body="{ data }"><Tag :value="data.level" :severity="data.level === 'error' ? 'danger' : 'secondary'" /></template>
+          </Column>
+          <Column field="operation" header="Operation" />
+          <Column field="target" header="Target" />
+          <Column field="outcome" header="Outcome" />
+          <Column field="detail" header="Detail" />
+        </DataTable>
       </section>
 
       <section v-if="activeTab === 'Settings'" class="page form settings">

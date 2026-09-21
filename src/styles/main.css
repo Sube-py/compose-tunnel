@@ -407,6 +407,49 @@ nav {
   text-align: center;
 }
 
+.log-notice {
+  margin: 0;
+  color: #5a6a66;
+}
+
+.log-error {
+  color: #a32c35;
+}
+
+.logs-table {
+  min-width: 0;
+}
+
+.logs-table .p-datatable-table {
+  table-layout: fixed;
+  width: 100%;
+  min-width: 710px;
+}
+
+.logs-table .p-datatable-table-container {
+  overflow-x: auto;
+}
+
+.logs-table .p-datatable-tbody > tr > td {
+  max-width: 320px;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.logs-table .log-time {
+  width: 20%;
+  white-space: nowrap;
+}
+
+.logs-table .log-level {
+  width: 10%;
+}
+
+.logs-table th:nth-child(3) { width: 16%; }
+.logs-table th:nth-child(4) { width: 29%; }
+.logs-table th:nth-child(5) { width: 10%; }
+.logs-table th:nth-child(6) { width: 15%; }
+
 .env-dialog {
   width: min(960px, calc(100vw - 32px));
 }
@@ -513,9 +556,23 @@ code {
 }
 
 @media (max-width: 860px) {
-  .shell,
+  .shell {
+    display: flex;
+    flex-direction: column;
+  }
+
   .split {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-scroll {
+    flex: 1;
+    min-height: 0;
+    height: auto;
+  }
+
+  .workspace {
+    padding: 16px;
   }
 
   .env-editor-header {
@@ -527,10 +584,17 @@ code {
   }
 
   .sidebar {
-    min-height: auto;
+    height: auto;
+    padding: 12px 16px;
+    gap: 8px;
   }
 
   nav {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .sidebar .p-button {
+    min-width: 0;
+    justify-content: center;
   }
 }

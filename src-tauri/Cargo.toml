@@ -19,8 +19,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 compose-tunnel-core = { path = "../crates/compose-tunnel-core" }
+log.workspace = true
 tauri = { workspace = true, features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json.workspace = true

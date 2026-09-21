@@ -1173,15 +1173,39 @@ async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
     let mut state = load_state_unlocked(state_file).await?;
     let mut changed = false;
     let mut stopped_targets = Vec::new();
+    let mut failed_targets = Vec::new();
 
     for tunnel in &mut state.tunnels {
-        if tunnel.status != TunnelStatus::Stopped || tunnel.ssh_pid.is_some() {
-            stopped_targets.push(tunnel_log_target(tunnel));
+        let needs_stop = tunnel.status != TunnelStatus::Stopped || tunnel.ssh_pid.is_some();
+        let target = tunnel_log_target(tunnel);
+        if needs_stop {
+            record_command_event(
+                log_dir.as_deref(),
+                OperationLevel::Info,
+                "Tunnel stop",
+                &target,
+                "attempt",
+                None,
+            );
         }
         if let Some(pid) = tunnel.ssh_pid {
-            let _ = kill_pid(pid).await;
+            if kill_pid(pid).await.is_err() {
+                record_command_event(
+                    log_dir.as_deref(),
+                    OperationLevel::Error,
+                    "Tunnel stop",
+                    &target,
+                    "failure",
+                    Some("local SSH process could not be stopped"),
+                );
+                failed_targets.push(target);
+                continue;
+            }
         }
-        changed |= tunnel.status != TunnelStatus::Stopped || tunnel.ssh_pid.is_some();
+        if needs_stop {
+            stopped_targets.push(target);
+        }
+        changed |= needs_stop;
         tunnel.status = TunnelStatus::Stopped;
         tunnel.ssh_pid = None;
     }
@@ -1211,12 +1235,30 @@ async fn close_all_tunnels_at(state_file: &Path) -> Result<()> {
     }
     record_command_event(
         log_dir.as_deref(),
-        OperationLevel::Info,
+        if failed_targets.is_empty() {
+            OperationLevel::Info
+        } else {
+            OperationLevel::Error
+        },
         "Tunnel stop all",
         "all tunnels",
-        "success",
-        Some(&format!("{} tunnel(s) stopped", stopped_targets.len())),
+        if failed_targets.is_empty() {
+            "success"
+        } else {
+            "failure"
+        },
+        Some(&format!(
+            "{} stopped, {} could not be stopped",
+            stopped_targets.len(),
+            failed_targets.len()
+        )),
     );
+    if !failed_targets.is_empty() {
+        return Err(AppError::msg(format!(
+            "could not stop {} local SSH forward(s)",
+            failed_targets.len()
+        )));
+    }
     Ok(())
 }
 
@@ -2249,8 +2291,15 @@ fn upsert_tunnel(state: &mut AppState, tunnel: TunnelState) {
 
 fn tunnel_log_target(tunnel: &TunnelState) -> String {
     format!(
-        "{}/{}/{}/{}",
-        tunnel.server, tunnel.project, tunnel.service, tunnel.container
+        "{}/{}/{}/{} {}:{} -> {}:{}",
+        tunnel.server,
+        tunnel.project,
+        tunnel.service,
+        tunnel.container,
+        format_forward_host(&tunnel.local_host),
+        tunnel.local_port,
+        format_forward_host(&tunnel.container_ip),
+        tunnel.target_port
     )
 }
 
@@ -2538,14 +2587,26 @@ fn pid_is_running(pid: u32) -> bool {
 async fn kill_pid(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill").arg(pid.to_string()).output().await?;
+        let pid = i32::try_from(pid).map_err(|_| AppError::msg("invalid process id"))?;
+        if pid == 0 {
+            return Err(AppError::msg("invalid process id"));
+        }
+        if unsafe { libc::kill(pid, libc::SIGTERM) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error.into());
+            }
+        }
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let output = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .output()
             .await?;
+        if !output.status.success() && pid_is_running(pid) {
+            return Err(AppError::msg("could not stop local SSH process"));
+        }
     }
     Ok(())
 }
@@ -2623,6 +2684,41 @@ mod tests {
             started_at: Some("2026-09-20T12:00:00Z".to_string()),
             last_error: None,
         }
+    }
+
+    #[test]
+    fn tunnel_log_target_distinguishes_local_and_remote_ports() {
+        let first = direct_tunnel(TunnelStatus::Running);
+        let mut second = first.clone();
+        second.local_port = 15433;
+        second.target_port = 5433;
+
+        assert!(tunnel_log_target(&first).contains("127.0.0.1:15432"));
+        assert!(tunnel_log_target(&first).contains("172.22.0.4:5432"));
+        assert_ne!(tunnel_log_target(&first), tunnel_log_target(&second));
+    }
+
+    #[tokio::test]
+    async fn stop_all_does_not_report_success_when_process_termination_fails() {
+        let app = TempApp::new("stop-all-kill-error");
+        let mut tunnel = direct_tunnel(TunnelStatus::Running);
+        tunnel.ssh_pid = Some(u32::MAX);
+        app.write_state(&AppState {
+            tunnels: vec![tunnel],
+        });
+
+        assert!(close_all_tunnels_at(&app.state_file).await.is_err());
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("logged operations");
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.operation == "Tunnel stop all" && entry.outcome == "failure" }));
+        assert!(!entries.iter().any(|entry| entry.outcome == "success"));
+        let state = load_state_unlocked(&app.state_file)
+            .await
+            .expect("saved state");
+        assert_eq!(state.tunnels[0].status, TunnelStatus::Running);
+        assert_eq!(state.tunnels[0].ssh_pid, Some(u32::MAX));
     }
 
     #[test]
@@ -3386,6 +3482,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ssh_forward_startup_exit_is_reported_as_an_open_failure() {
+        let app = TempApp::new("forward-startup-exit");
         let defaults = Defaults {
             local_host: "127.0.0.1".to_string(),
             ssh_binary: "sh".to_string(),
@@ -3393,9 +3490,17 @@ mod tests {
         };
         let server = staging_config("sh").servers.remove(0);
 
-        let error = spawn_ssh_forward(&defaults, &server, "127.0.0.1", 15432, "172.22.0.4", 5432)
-            .await
-            .expect_err("a forward that exits during startup must fail");
+        let error = spawn_ssh_forward_at(
+            &defaults,
+            &server,
+            "127.0.0.1",
+            15432,
+            "172.22.0.4",
+            5432,
+            Some(&app.dir.join("logs")),
+        )
+        .await
+        .expect_err("a forward that exits during startup must fail");
 
         assert!(
             error.to_string().contains("exited during startup"),

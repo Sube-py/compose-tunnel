@@ -77,6 +77,12 @@ pnpm install
 pnpm tauri dev
 ```
 
+## Operation Logs
+
+The CLI and desktop app append remote SSH/Docker operations and local forward lifecycle events to UTC daily `operations-YYYY-MM-DD.jsonl` files in the platform configuration directory's `logs` subdirectory. These files are not deleted automatically. The desktop Logs page shows the most recent 200 entries, receives new desktop events live, and has a Refresh control to load entries written by a separate CLI process.
+
+Entries contain operation names, server/container context, outcomes, and safe failure categories. Credentials, full remote commands, command output, SSH stderr, environment values, and tunnel traffic are not recorded. The Tauri log plugin delivers desktop events to the view; the shared JSONL journal is the only persistent copy.
+
 ## Env Profiles
 
 The desktop Env page is list-first. Use **Add Env** to open a PrimeVue dialog, choose a target project directory, add tunnel port bindings, and add extra env values.

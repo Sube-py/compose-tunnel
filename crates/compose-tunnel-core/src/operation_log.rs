@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Write},
     path::Path,
@@ -170,12 +171,20 @@ pub(crate) fn read_operation_logs_at(
     let mut entries = Vec::new();
     for path in paths.into_iter().rev() {
         let file = fs::File::open(path)?;
-        let mut daily = BufReader::new(file)
-            .lines()
-            .filter_map(|line| line.ok().and_then(|line| serde_json::from_str(&line).ok()))
-            .collect::<Vec<OperationLogEntry>>();
-        daily.reverse();
-        entries.extend(daily.into_iter().take(limit - entries.len()));
+        let remaining = limit - entries.len();
+        let mut daily = VecDeque::with_capacity(remaining);
+        for line in BufReader::new(file).lines() {
+            if let Some(entry) = line
+                .ok()
+                .and_then(|line| serde_json::from_str::<OperationLogEntry>(&line).ok())
+            {
+                if daily.len() == remaining {
+                    daily.pop_front();
+                }
+                daily.push_back(entry);
+            }
+        }
+        entries.extend(daily.into_iter().rev());
         if entries.len() >= limit {
             break;
         }
@@ -262,6 +271,34 @@ mod tests {
         assert_eq!(
             read_operation_logs_at(&dir.0, 1).expect("latest")[0].id,
             second.id
+        );
+    }
+
+    #[test]
+    fn operation_log_keeps_only_recent_entries_from_a_busy_day() {
+        let dir = TempLogDir::new();
+        let at = timestamp("2026-09-21T01:00:00Z");
+        let mut last_ids = Vec::new();
+        for index in 0..250 {
+            let entry = record_operation_at(
+                &dir.0,
+                at,
+                OperationLevel::Info,
+                "Docker inspect",
+                "staging/app/db",
+                "success",
+                None,
+            )
+            .expect("operation");
+            if index >= 248 {
+                last_ids.push(entry.id);
+            }
+        }
+
+        let entries = read_operation_logs_at(&dir.0, 2).expect("latest entries");
+        assert_eq!(
+            entries.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+            last_ids.iter().collect::<Vec<_>>()
         );
     }
 
