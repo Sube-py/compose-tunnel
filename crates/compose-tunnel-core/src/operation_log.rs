@@ -68,8 +68,24 @@ pub(crate) fn record_operation(
     outcome: &str,
     detail: Option<&str>,
 ) {
+    match app_paths() {
+        Ok(paths) => {
+            record_operation_in(&paths.logs_dir, level, operation, target, outcome, detail)
+        }
+        Err(_) => eprintln!("compose-tunnel: operation log directory is unavailable"),
+    }
+}
+
+pub(crate) fn record_operation_in(
+    log_dir: &Path,
+    level: OperationLevel,
+    operation: &str,
+    target: &str,
+    outcome: &str,
+    detail: Option<&str>,
+) {
     let entry = new_entry(Utc::now(), level, operation, target, outcome, detail);
-    match app_paths().and_then(|paths| append_entry(&paths.logs_dir, &entry)) {
+    match append_entry(log_dir, &entry) {
         Ok(()) => emit_entry(&entry),
         Err(_) => {
             eprintln!("compose-tunnel: operation log could not be persisted");
@@ -80,6 +96,7 @@ pub(crate) fn record_operation(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn record_operation_at(
     log_dir: &Path,
     at: DateTime<Utc>,

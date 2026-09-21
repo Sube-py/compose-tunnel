@@ -19,6 +19,7 @@ use tokio::{
 
 mod operation_log;
 pub use operation_log::{read_operation_logs, OperationLevel, OperationLogEntry};
+use operation_log::{record_operation, record_operation_in};
 
 pub type Result<T> = std::result::Result<T, AppError>;
 
@@ -747,7 +748,15 @@ pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
         details: Vec::new(),
     };
 
-    match run_ssh(&config.defaults, &server, "true").await {
+    match run_ssh(
+        &config.defaults,
+        &server,
+        "true",
+        "SSH connectivity",
+        &server.name,
+    )
+    .await
+    {
         Ok(_) => {
             result.ssh_ok = true;
             result.details.push("SSH connection succeeded".to_string());
@@ -762,7 +771,15 @@ pub async fn test_server(server_id: String) -> Result<ServerTestResult> {
 
     let docker = docker_command(&server);
     let version_command = format!("{docker} version --format '{{{{.Server.Version}}}}'");
-    match run_ssh(&config.defaults, &server, &version_command).await {
+    match run_ssh(
+        &config.defaults,
+        &server,
+        &version_command,
+        "Docker version",
+        &server.name,
+    )
+    .await
+    {
         Ok(output) => {
             result.docker_ok = true;
             result
@@ -787,7 +804,14 @@ pub async fn list_compose_projects(server_id: String) -> Result<Vec<ComposeProje
         docker_command(server),
         shell_quote(format)
     );
-    let output = run_ssh(&config.defaults, server, &command).await?;
+    let output = run_ssh(
+        &config.defaults,
+        server,
+        &command,
+        "Docker project discovery",
+        &server.name,
+    )
+    .await?;
 
     let mut projects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for line in output.lines() {
@@ -843,7 +867,14 @@ pub async fn list_compose_services(
         shell_quote(&project),
         shell_quote(&format)
     );
-    let output = run_ssh(&config.defaults, server, &command).await?;
+    let output = run_ssh(
+        &config.defaults,
+        server,
+        &command,
+        "Docker service discovery",
+        &format!("{}/{project}", server.name),
+    )
+    .await?;
 
     let mut services = Vec::new();
     for line in output.lines() {
@@ -1303,23 +1334,107 @@ async fn run_ssh(
     defaults: &Defaults,
     server: &ServerConfig,
     remote_command: &str,
+    operation: &'static str,
+    target: &str,
 ) -> Result<String> {
+    let log_dir = app_paths().ok().map(|paths| paths.logs_dir);
+    run_ssh_at(
+        defaults,
+        server,
+        remote_command,
+        operation,
+        target,
+        log_dir.as_deref(),
+    )
+    .await
+}
+
+fn record_command_event(
+    log_dir: Option<&Path>,
+    level: OperationLevel,
+    operation: &str,
+    target: &str,
+    outcome: &str,
+    detail: Option<&str>,
+) {
+    match log_dir {
+        Some(log_dir) => record_operation_in(log_dir, level, operation, target, outcome, detail),
+        None => record_operation(level, operation, target, outcome, detail),
+    }
+}
+
+async fn run_ssh_at(
+    defaults: &Defaults,
+    server: &ServerConfig,
+    remote_command: &str,
+    operation: &'static str,
+    target: &str,
+    log_dir: Option<&Path>,
+) -> Result<String> {
+    record_command_event(
+        log_dir,
+        OperationLevel::Info,
+        operation,
+        target,
+        "attempt",
+        None,
+    );
     let mut args = ssh_base_args(server);
     args.push(remote_command.to_string());
-    let output = run_command_with_timeout(
+    let output = match run_command_with_timeout(
         &defaults.ssh_binary,
         &args,
         Duration::from_secs(defaults.docker_timeout_secs),
         "ssh",
     )
-    .await?;
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let detail = if matches!(&error, AppError::Message(message) if message.starts_with("ssh timed out after"))
+            {
+                "timed out"
+            } else {
+                "SSH command could not start or complete"
+            };
+            record_command_event(
+                log_dir,
+                OperationLevel::Error,
+                operation,
+                target,
+                "failure",
+                Some(detail),
+            );
+            return Err(error);
+        }
+    };
     if !output.status.success() {
+        let detail = match output.status.code() {
+            Some(code) => format!("exit code {code}"),
+            None => "SSH command terminated by signal".to_string(),
+        };
+        record_command_event(
+            log_dir,
+            OperationLevel::Error,
+            operation,
+            target,
+            "failure",
+            Some(&detail),
+        );
         return Err(AppError::msg(command_error(
             "ssh",
             output.status.code(),
             &output.stderr,
         )));
     }
+    record_command_event(
+        log_dir,
+        OperationLevel::Info,
+        operation,
+        target,
+        "success",
+        None,
+    );
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
@@ -1473,8 +1588,19 @@ async fn inspect_container(
         docker_command(server),
         shell_quote(container)
     );
-    let output = run_ssh(defaults, server, &command).await?;
-    parse_inspected_container(&output, container, project, service, network)
+    let target = format!("{}/{project}/{service}/{container}", server.name);
+    let output = run_ssh(defaults, server, &command, "Docker inspect", &target).await?;
+    let inspected = parse_inspected_container(&output, container, project, service, network);
+    if inspected.is_err() {
+        record_operation(
+            OperationLevel::Error,
+            "Docker inspect validation",
+            &target,
+            "failure",
+            Some("container state, labels, network, or IP did not match"),
+        );
+    }
+    inspected
 }
 
 fn resolve_network(
@@ -2597,6 +2723,110 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("fake ssh should be executable");
         script
+    }
+
+    #[cfg(unix)]
+    fn write_remote_log_test_ssh(app: &TempApp, name: &str, body: &str) -> PathBuf {
+        let script = app.dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("fake SSH script");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("fake SSH metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("fake SSH executable");
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_command_logs_failure_without_remote_output() {
+        let app = TempApp::new("remote-log-failure");
+        let script = write_remote_log_test_ssh(
+            &app,
+            "fail-ssh",
+            "echo STDOUT_OUTPUT_MARKER; echo STDERR_OUTPUT_MARKER >&2; exit 7",
+        );
+        let config = staging_config(&script.to_string_lossy());
+        let error = run_ssh_at(
+            &config.defaults,
+            &config.servers[0],
+            "printf RAW_COMMAND_OUTPUT_MARKER",
+            "Docker inspect",
+            "staging/app/db/app-db-1",
+            Some(&app.dir.join("logs")),
+        )
+        .await
+        .expect_err("remote SSH failure");
+        assert!(error.to_string().contains("STDERR_OUTPUT_MARKER"));
+
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("logged operations");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].outcome, "attempt");
+        assert_eq!(entries[1].outcome, "failure");
+        assert_eq!(entries[1].operation, "Docker inspect");
+        assert_eq!(entries[1].target, "staging/app/db/app-db-1");
+        assert_eq!(entries[1].detail.as_deref(), Some("exit code 7"));
+        let journal = serde_json::to_string(&entries).expect("serialize journal");
+        assert!(!journal.contains("OUTPUT_MARKER"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_command_logs_success_without_stdout() {
+        let app = TempApp::new("remote-log-success");
+        let script = write_remote_log_test_ssh(&app, "success-ssh", "echo STDOUT_OUTPUT_MARKER");
+        let config = staging_config(&script.to_string_lossy());
+        let output = run_ssh_at(
+            &config.defaults,
+            &config.servers[0],
+            "true",
+            "SSH connectivity",
+            "staging",
+            Some(&app.dir.join("logs")),
+        )
+        .await
+        .expect("remote SSH success");
+        assert!(output.contains("STDOUT_OUTPUT_MARKER"));
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("logged operations");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.outcome.as_str())
+                .collect::<Vec<_>>(),
+            ["attempt", "success"]
+        );
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("OUTPUT_MARKER"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_command_logs_timeout_without_command_output() {
+        let app = TempApp::new("remote-log-timeout");
+        let script = write_remote_log_test_ssh(&app, "timeout-ssh", "sleep 3");
+        let mut config = staging_config(&script.to_string_lossy());
+        config.defaults.docker_timeout_secs = 1;
+        let error = run_ssh_at(
+            &config.defaults,
+            &config.servers[0],
+            "printf RAW_COMMAND_OUTPUT_MARKER",
+            "Docker version",
+            "staging",
+            Some(&app.dir.join("logs")),
+        )
+        .await
+        .expect_err("remote SSH timeout");
+        assert!(error.to_string().contains("timed out"));
+        let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
+            .expect("logged operations");
+        assert_eq!(entries[1].outcome, "failure");
+        assert_eq!(entries[1].detail.as_deref(), Some("timed out"));
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("OUTPUT_MARKER"));
     }
 
     #[cfg(unix)]
