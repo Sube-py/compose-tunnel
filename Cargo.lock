@@ -603,6 +603,7 @@ dependencies = [
  "chrono",
  "directories",
  "glob",
+ "log",
  "portpicker",
  "serde",
  "serde_json",

@@ -9,6 +9,7 @@ anyhow.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 directories.workspace = true
 glob.workspace = true
+log.workspace = true
 portpicker.workspace = true
 serde.workspace = true
 serde_json.workspace = true

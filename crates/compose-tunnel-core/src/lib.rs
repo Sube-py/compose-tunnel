@@ -17,6 +17,9 @@ use tokio::{
     time,
 };
 
+mod operation_log;
+pub use operation_log::{read_operation_logs, OperationLevel, OperationLogEntry};
+
 pub type Result<T> = std::result::Result<T, AppError>;
 
 #[derive(Debug, thiserror::Error)]
