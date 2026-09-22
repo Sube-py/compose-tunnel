@@ -1866,9 +1866,8 @@ async fn spawn_ssh_forward_at(
         }
     };
 
-    time::sleep(Duration::from_millis(250)).await;
-    match child.try_wait() {
-        Ok(Some(status)) => {
+    match time::timeout(Duration::from_secs(1), child.wait()).await {
+        Ok(Ok(status)) => {
             if let Some((dir, entry)) = &journal {
                 if finish_command_in(dir, entry, CommandStatus::Failure, status.code()).is_err() {
                     command_log::emit_persistence_error();
@@ -1890,7 +1889,7 @@ async fn spawn_ssh_forward_at(
                 "ssh forward exited during startup with status {status}"
             )))
         }
-        Ok(None) => {
+        Err(_) => {
             let detail = child.id().map(|pid| format!("PID {pid}"));
             record_command_event(
                 log_dir,
@@ -1905,7 +1904,7 @@ async fn spawn_ssh_forward_at(
                 command_log_id: journal.map(|(_, entry)| entry.id),
             })
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             // The child state is unknown, so it may still be forwarding: kill
             // and reap it instead of dropping a live SSH process.
             let _ = child.kill().await;
@@ -4009,9 +4008,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn forward_logs_startup_failure() {
+    async fn forward_detects_failure_during_startup_grace_period() {
         let app = TempApp::new("forward-log-failure");
-        let ssh = write_remote_log_test_ssh(&app, "forward-ssh", "exit 9");
+        let ssh = write_remote_log_test_ssh(&app, "forward-ssh", "sleep 0.35; exit 9");
         let config = staging_config(&ssh.to_string_lossy());
         spawn_ssh_forward_at(
             &config.defaults,
@@ -4023,7 +4022,7 @@ mod tests {
             Some(&app.dir.join("logs")),
         )
         .await
-        .expect_err("fake forward exits immediately");
+        .expect_err("fake forward exits during startup");
 
         let entries = operation_log::read_operation_logs_at(&app.dir.join("logs"), 200)
             .expect("forward events");
