@@ -77,6 +77,23 @@ pnpm install
 pnpm tauri dev
 ```
 
+## Publish Desktop Updates
+
+Tagged releases generate signed updater archives, signature files, and `latest.json` alongside the normal installers. The app checks `https://github.com/Sube-py/compose-tunnel/releases/latest/download/latest.json` at startup and also exposes a manual check in Settings.
+
+The updater signing key is not stored in this repository. Generate a password-protected key with `pnpm tauri signer generate --write-keys ~/.tauri/compose-tunnel-updater.key`, restrict the private file to the current user, and put the generated public key in `src-tauri/tauri.conf.json`. The current release machine keeps the password in macOS Keychain under the service `compose-tunnel-updater-signing`.
+
+GitHub Actions uses these repository secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY` contains the complete text content of the private key file, not its path.
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` contains the key password exactly as entered during generation.
+
+Back up the private key and password together in an encrypted, access-controlled store. Test a restored copy by performing a signed local build and confirming that both the updater archive and its `.sig` file are produced. Losing either value prevents installed clients from accepting future updates.
+
+Do not replace the public key in a normal release. Existing clients trust the public key embedded in their installed version, so they cannot accept a release signed only by a new key. Rotation requires a bridge release signed by the old key that embeds the new public key; only after clients can install that bridge release may later releases be signed by the new private key. Keep the old key recoverable until the migration window has ended.
+
+Clients on `v0.1.5` or earlier must install the first updater-enabled release manually. Automatic updates work for releases installed after that transition.
+
 ## Command Logs
 
 The desktop Logs page shows the newest 200 SSH command invocations, including Compose discovery (`docker ps`), inspect, connectivity checks, and local `ssh -N -L` forwards. Click a row to see the exact local command, remote command, exit status, and complete stdout/stderr. Live desktop status changes arrive through the Tauri log plugin; Refresh loads commands written by the CLI, and the open detail dialog has its own Refresh control for ongoing output. Earlier operation summaries are retained on disk but are not mixed into this command list.

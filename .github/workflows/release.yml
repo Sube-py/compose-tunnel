@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.0"
+        description: "Existing release tag, for example v0.1.0"
         required: true
         type: string
 
@@ -16,13 +16,49 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Match tag to application versions
+        shell: bash
+        run: |
+          node <<'NODE'
+          const { execFileSync } = require("node:child_process");
+          const { readFileSync } = require("node:fs");
+
+          const releaseTag = process.env.RELEASE_TAG;
+          const packageVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
+          const tauriVersion = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8")).version;
+          const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], { encoding: "utf8" }));
+          const cargoVersion = metadata.packages.find(({ name }) => name === "compose-tunnel")?.version;
+          const versions = { package: packageVersion, tauri: tauriVersion, cargo: cargoVersion };
+
+          for (const [source, version] of Object.entries(versions)) {
+            if (!version || releaseTag !== `v${version}`) {
+              throw new Error(`Release tag ${releaseTag} does not match ${source} version ${version ?? "missing"}`);
+            }
+          }
+          NODE
+
   publish-tauri:
     name: Build ${{ matrix.name }}
+    needs: validate-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - name: Linux
@@ -35,6 +71,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -72,13 +110,100 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build and publish Tauri bundles
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          releaseName: compose-tunnel ${{ github.event.inputs.tag || github.ref_name }}
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: compose-tunnel ${{ env.RELEASE_TAG }}
           releaseBody: |
-            Desktop builds for Windows, macOS, and Linux.
-          releaseDraft: false
+            Release notes are generated after all desktop builds finish.
+          releaseDraft: true
           prerelease: false
+          generateReleaseNotes: false
+
+  publish-release:
+    name: Validate and publish release
+    needs: publish-tauri
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir release-artifacts
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].url' > release-asset-urls.txt
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" \
+            --jq .body > release-notes.md
+
+      - name: Validate and finalize updater manifest
+        shell: bash
+        run: |
+          node <<'NODE'
+          const { readFileSync, writeFileSync } = require("node:fs");
+
+          const manifestPath = "release-artifacts/latest.json";
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+          const expectedVersion = process.env.RELEASE_TAG.slice(1);
+          if (manifest.version !== expectedVersion) {
+            throw new Error(`Updater manifest version ${manifest.version} does not match release ${process.env.RELEASE_TAG}`);
+          }
+
+          const assetUrls = new Set(readFileSync("release-asset-urls.txt", "utf8").split("\n").filter(Boolean));
+          const expectedPathPrefix = `/${process.env.GITHUB_REPOSITORY}/releases/download/${process.env.RELEASE_TAG}/`;
+          const platformNames = Object.keys(manifest.platforms ?? {});
+          const requiredPlatforms = {
+            macOS: (name) => name.startsWith("darwin-"),
+            Linux: (name) => name.startsWith("linux-"),
+            Windows: (name) => name.startsWith("windows-"),
+          };
+
+          for (const [label, matches] of Object.entries(requiredPlatforms)) {
+            if (!platformNames.some(matches)) {
+              throw new Error(`Updater manifest is missing a ${label} target: ${platformNames.join(", ")}`);
+            }
+          }
+          for (const [platform, artifact] of Object.entries(manifest.platforms)) {
+            if (!artifact.signature || !artifact.url) {
+              throw new Error(`Updater manifest has an incomplete ${platform} artifact`);
+            }
+            const artifactUrl = new URL(artifact.url);
+            if (artifactUrl.origin !== "https://github.com" || !decodeURIComponent(artifactUrl.pathname).startsWith(expectedPathPrefix)) {
+              throw new Error(`Updater manifest has an unexpected ${platform} URL: ${artifact.url}`);
+            }
+            if (!assetUrls.has(artifact.url) || !assetUrls.has(`${artifact.url}.sig`)) {
+              throw new Error(`Updater manifest references missing ${platform} release assets`);
+            }
+            if (!/^[A-Za-z0-9+/]+={0,2}$/.test(artifact.signature) || artifact.signature.length % 4 !== 0) {
+              throw new Error(`Updater manifest has an invalid ${platform} signature encoding`);
+            }
+            const signature = Buffer.from(artifact.signature, "base64").toString("utf8");
+            if (!signature.startsWith("untrusted comment: signature from tauri secret key\n") || !signature.includes("\ntrusted comment:")) {
+              throw new Error(`Updater manifest has an invalid ${platform} minisign signature`);
+            }
+          }
+
+          const releaseNotes = readFileSync("release-notes.md", "utf8").trim();
+          if (!releaseNotes) {
+            throw new Error("GitHub generated empty release notes");
+          }
+          manifest.notes = releaseNotes;
+          writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$RELEASE_TAG" release-artifacts/latest.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md --draft=false --latest

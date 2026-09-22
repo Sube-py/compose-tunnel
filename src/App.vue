@@ -1,8 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, shallowReactive } from "vue";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { attachLogger } from "@tauri-apps/plugin-log";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
 import { useConfirm } from "primevue/useconfirm";
 import { useToast } from "primevue/usetoast";
 import Button from "primevue/button";
@@ -13,12 +17,14 @@ import DataTable from "primevue/datatable";
 import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
 import InputText from "primevue/inputtext";
+import ProgressBar from "primevue/progressbar";
 import ScrollPanel from "primevue/scrollpanel";
 import Select from "primevue/select";
 import SelectButton from "primevue/selectbutton";
 import Tag from "primevue/tag";
 import Toast from "primevue/toast";
 import logoUrl from "../assets/logo.svg";
+import { createAppUpdater, createUpdateState } from "./app-updater";
 import { decodeOutput, isCommandLogPersistenceError, mergeCommandLogs, parseCommandLogMessage, type CommandLogDetail, type CommandLogEntry } from "./command-logs";
 import {
   buildContainerOptions,
@@ -113,6 +119,12 @@ const confirm = useConfirm();
 const activeTab = ref<Tab>("Dashboard");
 const loading = ref(false);
 const busyActions = ref<Record<string, boolean>>({});
+const currentAppVersion = ref("");
+const updateState = shallowReactive(createUpdateState());
+const appUpdater = createAppUpdater(updateState, {
+  check: () => check({ timeout: 15_000 }),
+  relaunch,
+});
 const logs = ref<CommandLogEntry[]>([]);
 const logsLoading = ref(false);
 const logReadError = ref("");
@@ -183,6 +195,23 @@ const envProfileForm = reactive<EnvProfileConfig>({
 
 const runningCount = computed(() => tunnels.value.filter((item) => item.status === "running").length);
 const stoppedCount = computed(() => tunnels.value.filter((item) => item.status !== "running").length);
+const updateBusy = computed(() => updateState.phase === "checking" || updateState.phase === "downloading" || updateState.phase === "installing");
+const updateDialogHeader = computed(() => updateState.phase === "restart-required" ? "Restart required" : "Update available");
+const updateProgress = computed(() => {
+  if (!updateState.totalBytes) {
+    return 0;
+  }
+  return Math.min(100, Math.round((updateState.downloadedBytes / updateState.totalBytes) * 100));
+});
+const updateStatus = computed(() => {
+  if (updateState.phase === "checking") return "Checking for updates...";
+  if (updateState.phase === "available") return `Version ${updateState.update?.version} is available.`;
+  if (updateState.phase === "downloading") return "Downloading update...";
+  if (updateState.phase === "installing") return "Finishing update and restarting...";
+  if (updateState.phase === "restart-required") return "Update installed. Restart the app to finish.";
+  if (updateState.phase === "error") return updateState.error;
+  return "Updates are checked automatically when the app starts.";
+});
 const dockerCommandPreset = computed(() => {
   if (serverForm.docker_command === "docker") {
     return "docker";
@@ -846,6 +875,64 @@ async function saveDefaultSettings() {
   );
 }
 
+async function loadAppVersion() {
+  try {
+    currentAppVersion.value = await getVersion();
+  } catch {
+    currentAppVersion.value = "Unknown";
+  }
+}
+
+async function checkForUpdates(manual = false) {
+  if (updateState.phase === "checking" || updateBusy.value) {
+    return;
+  }
+  const result = await appUpdater.check();
+  if (!manual) {
+    return;
+  }
+  if (result.kind === "up-to-date") {
+    toast.add({ severity: "success", summary: "You are up to date", life: 2600 });
+  } else if (result.kind === "error") {
+    toast.add({ severity: "error", summary: "Update check failed", detail: result.message, life: 5000 });
+  }
+}
+
+async function installUpdate() {
+  const result = await appUpdater.install();
+  if (result.kind === "error") {
+    toast.add({ severity: "error", summary: "Update failed", detail: result.message, life: 5000 });
+  } else if (result.kind === "restart-required") {
+    toast.add({ severity: "warn", summary: "Update installed", detail: "Restart the app to finish updating.", life: 5000 });
+  }
+}
+
+async function restartAfterUpdate() {
+  const result = await appUpdater.restart();
+  if (result.kind === "restart-required") {
+    toast.add({ severity: "error", summary: "Restart failed", detail: result.message, life: 5000 });
+  }
+}
+
+function dismissUpdate() {
+  appUpdater.dismiss();
+}
+
+function reviewAvailableUpdate() {
+  if (updateState.update) {
+    updateState.dialogVisible = true;
+  }
+}
+
+async function openLatestRelease() {
+  try {
+    await openUrl("https://github.com/Sube-py/compose-tunnel/releases/latest");
+  } catch (caught) {
+    const message = caught instanceof Error ? caught.message : String(caught);
+    toast.add({ severity: "error", summary: "Could not open release page", detail: message, life: 5000 });
+  }
+}
+
 function newEnvProfile() {
   selectedEnvProfileName.value = "";
   editingEnvProfileName.value = "";
@@ -1357,7 +1444,10 @@ function onDockerModeChange(value: string) {
 
 onMounted(() => {
   logsMounted = true;
-  void initializeLogs().then(bootstrap);
+  void loadAppVersion();
+  void initializeLogs()
+    .then(bootstrap)
+    .finally(() => checkForUpdates());
 });
 onUnmounted(() => {
   logsMounted = false;
@@ -1369,6 +1459,63 @@ onUnmounted(() => {
   <main class="shell">
     <Toast position="top-right" />
     <ConfirmDialog />
+    <Dialog
+      v-model:visible="updateState.dialogVisible"
+      modal
+      :header="updateDialogHeader"
+      class="update-dialog"
+      :closable="!updateBusy"
+      :closeOnEscape="!updateBusy"
+    >
+      <div v-if="updateState.update" class="update-content">
+        <div class="update-version">
+          <i class="pi pi-cloud-download" aria-hidden="true" />
+          <div>
+            <strong>Version {{ updateState.update.version }}</strong>
+            <span>Installed: {{ updateState.update.currentVersion }}</span>
+          </div>
+        </div>
+        <div v-if="updateState.update.body" class="update-notes">
+          <strong>What's new</strong>
+          <p>{{ updateState.update.body }}</p>
+        </div>
+        <p v-if="updateState.phase === 'error'" class="update-error" role="alert">{{ updateState.error }}</p>
+        <div v-else-if="updateState.phase === 'restart-required'" class="update-restart-required" role="status">
+          <i class="pi pi-check-circle" aria-hidden="true" />
+          <div>
+            <strong>Update installed</strong>
+            <span>Restart the app to finish updating.</span>
+            <small v-if="updateState.error">Last restart attempt: {{ updateState.error }}</small>
+          </div>
+        </div>
+        <div v-if="updateState.phase === 'downloading'" class="update-progress" aria-live="polite">
+          <ProgressBar
+            v-if="updateState.totalBytes"
+            :value="updateProgress"
+            :showValue="true"
+          />
+          <ProgressBar v-else mode="indeterminate" :showValue="false" />
+          <span>{{ updateStatus }}</span>
+        </div>
+        <p v-else-if="updateState.phase === 'installing'" class="update-status" aria-live="polite">
+          <i class="pi pi-spin pi-spinner" aria-hidden="true" />
+          {{ updateStatus }}
+        </p>
+      </div>
+      <template #footer>
+        <div class="update-dialog-actions">
+          <Button label="View Release" icon="pi pi-external-link" severity="secondary" text :disabled="updateBusy" @click="openLatestRelease" />
+          <Button label="Later" severity="secondary" outlined :disabled="updateBusy" @click="dismissUpdate" />
+          <Button
+            :label="updateState.phase === 'restart-required' ? 'Restart App' : updateState.phase === 'error' ? 'Retry Download' : 'Download and Restart'"
+            :icon="updateState.phase === 'restart-required' ? 'pi pi-power-off' : 'pi pi-download'"
+            :loading="updateBusy"
+            :disabled="updateBusy"
+            @click="updateState.phase === 'restart-required' ? restartAfterUpdate() : installUpdate()"
+          />
+        </div>
+      </template>
+    </Dialog>
     <aside class="sidebar">
       <div class="brand">
         <img class="brand-mark" :src="logoUrl" alt="" />
@@ -1876,11 +2023,37 @@ onUnmounted(() => {
         </Dialog>
       </section>
 
-      <section v-if="activeTab === 'Settings'" class="page form settings">
-        <label>Default local host<InputText v-model="defaults.local_host" /></label>
-        <label>SSH binary<InputText v-model="defaults.ssh_binary" /></label>
-        <label>Docker timeout seconds<InputNumber v-model="defaults.docker_timeout_secs" :min="1" :useGrouping="false" fluid /></label>
-        <Button label="Save Settings" icon="pi pi-save" :loading="isBusy('settings:save')" :disabled="isBusy('settings:save')" @click="saveDefaultSettings" />
+      <section v-if="activeTab === 'Settings'" class="page settings">
+        <div class="panel form">
+          <h3>Connection defaults</h3>
+          <label>Default local host<InputText v-model="defaults.local_host" /></label>
+          <label>SSH binary<InputText v-model="defaults.ssh_binary" /></label>
+          <label>Docker timeout seconds<InputNumber v-model="defaults.docker_timeout_secs" :min="1" :useGrouping="false" fluid /></label>
+          <div class="toolbar">
+            <Button label="Save Settings" icon="pi pi-save" :loading="isBusy('settings:save')" :disabled="isBusy('settings:save')" @click="saveDefaultSettings" />
+          </div>
+        </div>
+        <div class="panel update-settings">
+          <div class="row-between">
+            <div>
+              <h3>Application updates</h3>
+              <p class="subtle">Current version {{ currentAppVersion || 'Loading...' }}</p>
+            </div>
+            <Tag v-if="updateState.update" :value="`v${updateState.update.version}`" severity="info" />
+          </div>
+          <p :class="['update-settings-status', { 'update-error': updateState.phase === 'error' }]" aria-live="polite">{{ updateStatus }}</p>
+          <div class="toolbar">
+            <Button
+              label="Check for Updates"
+              icon="pi pi-refresh"
+              :loading="updateState.phase === 'checking'"
+              :disabled="updateBusy || updateState.phase === 'restart-required'"
+              @click="checkForUpdates(true)"
+            />
+            <Button v-if="updateState.update" label="Review Update" icon="pi pi-cloud-download" outlined :disabled="updateBusy" @click="reviewAvailableUpdate" />
+            <Button label="View Releases" icon="pi pi-external-link" severity="secondary" text :disabled="updateBusy" @click="openLatestRelease" />
+          </div>
+        </div>
       </section>
       </section>
     </ScrollPanel>

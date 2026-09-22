@@ -170,7 +170,144 @@ nav {
 }
 
 .settings {
-  max-width: 520px;
+  max-width: 680px;
+}
+
+.settings .panel h3,
+.settings .panel p {
+  margin: 0;
+}
+
+.update-settings-status {
+  min-height: 24px;
+  color: #53655f;
+}
+
+.update-dialog {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.update-content {
+  display: grid;
+  gap: 16px;
+}
+
+.update-version {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.update-version > i {
+  display: inline-flex;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: #e7f3ef;
+  color: #236b5a;
+  font-size: 18px;
+}
+
+.update-version > div {
+  display: grid;
+  min-width: 0;
+}
+
+.update-version strong {
+  font-size: 16px;
+}
+
+.update-version span,
+.update-status,
+.update-progress span {
+  color: #5a6a66;
+  font-size: 13px;
+}
+
+.update-notes {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  padding: 12px;
+  overflow-y: auto;
+  border: 1px solid #dce5e2;
+  border-radius: 6px;
+  background: #f7faf9;
+}
+
+.update-notes p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.update-progress {
+  display: grid;
+  gap: 8px;
+}
+
+.update-progress .p-progressbar {
+  height: 10px;
+}
+
+.update-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.update-restart-required {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #b8d9cf;
+  border-radius: 6px;
+  background: #eef8f5;
+  color: #205f50;
+}
+
+.update-restart-required > i {
+  margin-top: 2px;
+  font-size: 18px;
+}
+
+.update-restart-required > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.update-restart-required span,
+.update-restart-required small {
+  overflow-wrap: anywhere;
+}
+
+.update-restart-required small {
+  color: #53655f;
+}
+
+.update-error {
+  margin: 0;
+  color: #a32c35;
+  overflow-wrap: anywhere;
+}
+
+.update-dialog-actions {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.update-dialog-actions .p-button:first-child {
+  margin-right: auto;
 }
 
 .toolbar,

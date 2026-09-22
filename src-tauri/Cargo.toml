@@ -24,5 +24,7 @@ tauri = { workspace = true, features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 serde.workspace = true
 serde_json.workspace = true
